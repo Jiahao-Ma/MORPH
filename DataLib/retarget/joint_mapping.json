@@ -1,0 +1,55 @@
+{
+    "description": "Robot-to-human joint mapping (G1 <-> scaled human)",
+    "robot": "unitree_g1",
+    "human_src": "bvh_ue5_g1scale",
+    "mappings": [
+        {
+            "robot": "left_hip_pitch_link",
+            "human": "thigh_l"
+        },
+        {
+            "robot": "right_hip_pitch_link",
+            "human": "thigh_r"
+        },
+        {
+            "robot": "left_knee_link",
+            "human": "calf_l"
+        },
+        {
+            "robot": "right_knee_link",
+            "human": "calf_r"
+        },
+        {
+            "robot": "left_ankle_roll_link",
+            "human": "LeftFootMod"
+        },
+        {
+            "robot": "right_ankle_roll_link",
+            "human": "RightFootMod"
+        },
+        {
+            "robot": "left_shoulder_pitch_link",
+            "human": "upperarm_l"
+        },
+        {
+            "robot": "right_shoulder_pitch_link",
+            "human": "upperarm_r"
+        },
+        {
+            "robot": "left_elbow_link",
+            "human": "lowerarm_l"
+        },
+        {
+            "robot": "right_elbow_link",
+            "human": "lowerarm_r"
+        },
+        {
+            "robot": "left_wrist_yaw_link",
+            "human": "hand_l"
+        },
+        {
+            "robot": "right_wrist_yaw_link",
+            "human": "hand_r"
+        }
+    ]
+}

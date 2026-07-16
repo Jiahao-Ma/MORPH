@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated exports (tests write here; do not commit)
+data/RetargetOutputs/
+
+# Keep the trimmed sample recordings under data/sample/ tracked.
+!data/sample/
