@@ -22,12 +22,15 @@ per-frame).
 
 | category | clips | frames | hours | traversal attempts |
 |----------|------:|-------:|------:|-------------------:|
-| `ground` | 8 | 864,000 | 4.00 | — |
-| `stairs` | 24 | 1,303,032 | 6.03 | — |
+| `ground` | 8 | 864,000 | 4.00 | - |
+| `stairs` | 24 | 1,303,032 | 6.03 | - |
 | `traversal_mantle` | 364 | 2,025,284 | 9.65 | **5,483** |
 | `traversal_mantle_vault` | 250 | 2,158,286 | 10.77 | **9,795** |
 | `traversal_vault` | 245 | 2,222,712 | 10.92 | **5,930** |
 | **total** | **891** | **8,573,314** | **41.38** | **21,208** |
+
+Full v1 data: [`MorphData_v1.zip`](https://pan.baidu.com/s/1skKd-Ds431xWPmUoKSicIQ)
+(Baidu Netdisk, extract code: `md7d`).
 
 This repo ships trimmed samples under `data/sample/` only; the full v1 set is
 not vendored here.
