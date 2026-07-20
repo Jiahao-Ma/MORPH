@@ -14,6 +14,26 @@ scripts for post-processing, export, and visualization.
 
 ---
 
+## Dataset (v1)
+
+First-release GASP capture stats (`RetargetInputs`, 60 Hz). Traversal counts
+are **continuous `cmd.jump=true` runs** (one pulse streak = one attempt, not
+per-frame).
+
+| category | clips | frames | hours | traversal attempts |
+|----------|------:|-------:|------:|-------------------:|
+| `ground` | 8 | 864,000 | 4.00 | — |
+| `stairs` | 24 | 1,303,032 | 6.03 | — |
+| `traversal_mantle` | 364 | 2,025,284 | 9.65 | **5,483** |
+| `traversal_mantle_vault` | 250 | 2,158,286 | 10.77 | **9,795** |
+| `traversal_vault` | 245 | 2,222,712 | 10.92 | **5,930** |
+| **total** | **891** | **8,573,314** | **41.38** | **21,208** |
+
+This repo ships trimmed samples under `data/sample/` only; the full v1 set is
+not vendored here.
+
+---
+
 ## 1. Repository layout
 
 ```
@@ -70,27 +90,41 @@ deps. The vendored GMR is imported via `DataLib/gmr/` (the scripts put it on
 
 ## 3. The scaling gap (important)
 
-Recordings were captured with two different UE character sizes:
+The pipeline reads world-space joint positions (`joints[*].wp`), which
+already include the in-engine character mesh scale (`root.mesh.s` in the
+JSONL). Check that field to know what a recording actually contains:
 
-| category   | UE character        | src-human            | `--data-scale` | alignment config                  |
-|------------|---------------------|----------------------|----------------|-----------------------------------|
-| `stairs`   | pre-scaled to G1    | `bvh_ue5_g1scale`    | `1.0`          | `gasp_bvh_alignment_g1_height.json` |
-| `ground`   | original 1.75 m     | `bvh_ue5_native`     | `0.77`         | `gasp_bvh_alignment.json`         |
-| `traversal`| original 1.75 m     | `bvh_ue5_native`     | `0.77`         | `gasp_bvh_alignment.json`         |
+| category   | `root.mesh.s` | effective data height | src-human         | `--data-scale` | alignment config                    |
+|------------|---------------|-----------------------|-------------------|----------------|-------------------------------------|
+| `ground`   | `0.77`        | already G1            | `bvh_ue5_g1scale` | `1.0`          | `gasp_bvh_alignment_g1_height.json` |
+| `stairs`   | `0.77`        | already G1            | `bvh_ue5_g1scale` | `1.0`          | `gasp_bvh_alignment_g1_height.json` |
+| `traversal`| `1.0`         | original UE height    | `bvh_ue5_g1scale` | `0.77`         | `gasp_bvh_alignment_g1_height.json` |
 
 G1 is ≈ 0.77× the height of the original UE character. `--data-scale`
 uniformly scales the source UE motion positions (and the visualization
 terrain) about the UE world origin **before** the Kabsch/ball-align/retarget
-pipeline runs, so a batch captured at the original UE character height is
-shrunk to G1 height. Rotations are scale-free. After scaling, the same
-Kabsch config (calibrated for G1-scale data) applies to all categories, so
-the exported retargeted motions come out consistent across categories.
+pipeline runs. The rule is simple: after `mesh.s × data-scale` everything
+must be at G1 height, and then **every** category uses the same G1-scale
+pairing (`bvh_ue5_g1scale` + `gasp_bvh_alignment_g1_height.json`).
 
-* `stairs` was already recorded with a G1-scaled character → `--data-scale 1.0`.
-* `ground` / `traversal` were recorded at the original UE height → `--data-scale 0.77`.
+> ⚠ Do NOT stack `--data-scale 0.77` on a recording whose `mesh.s` is already
+> `0.77`, and do not pair scaled data with the `bvh_ue5_native` /
+> `gasp_bvh_alignment.json` combo (that combo is only for unscaled 1.75 m
+> data with `--data-scale 1.0`). A wrong pairing shrinks the IK targets far
+> below G1's reachable pose, drives the solver against joint limits and shows
+> up as violent pelvis jitter.
 
 `ue_world_skeleton_retarget.py` and `batch_retarget.py` both accept
 `--data-scale` (the batcher forwards it to the retarget script).
+
+Two more flags matter for output quality (both used by the tests):
+
+* `--height-from-data` — estimate the human height from the motion itself
+  (same as the verify_pipeline viewers) instead of the config constant, so
+  the export scale matches the verified diagnostic view.
+* `--smooth-win N` (default 9) — zero-phase temporal smoothing of the root
+  XY trajectory and the grounding Δz, so raw per-frame capture noise does not
+  feed 1:1 into the G1 pelvis. Set `0` to disable.
 
 ---
 
@@ -158,21 +192,21 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
 2. Export a single recording:
 
    ```bash
-   # ground / traversal (original UE height)
+   # recording captured at the original UE height (root.mesh.s == 1.0)
    python DataLib/retarget/ue_world_skeleton_retarget.py \
-       --jsonl data/myground/MyRec_frames.jsonl \
-       --meta  data/myground/MyRec_meta.json \
-       --config DataLib/retarget/gasp_bvh_alignment.json \
-       --src-human bvh_ue5_native --data-scale 0.77 \
-       --output-qpos data/RetargetOutputs/myground/MyRec_frames.npy \
+       --jsonl data/mytraversal/MyRec_frames.jsonl \
+       --meta  data/mytraversal/MyRec_meta.json \
+       --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
+       --src-human bvh_ue5_g1scale --data-scale 0.77 --height-from-data \
+       --output-qpos data/RetargetOutputs/mytraversal/MyRec_frames.npy \
        --no-visualize
 
-   # stairs (already G1-scaled)
+   # recording captured with an already G1-scaled character (root.mesh.s == 0.77)
    python DataLib/retarget/ue_world_skeleton_retarget.py \
        --jsonl data/mystairs/MyRec_frames.jsonl \
        --meta  data/mystairs/MyRec_meta.json \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
-       --src-human bvh_ue5_g1scale --data-scale 1.0 \
+       --src-human bvh_ue5_g1scale --data-scale 1.0 --height-from-data \
        --output-qpos data/RetargetOutputs/mystairs/MyRec_frames.npy \
        --no-visualize
    ```
@@ -181,9 +215,10 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
 
    ```bash
    python DataLib/batch/batch_retarget.py \
-       --input-dir data/myground --output-dir data/RetargetOutputs/myground \
-       --config DataLib/retarget/gasp_bvh_alignment.json \
-       --data-scale 0.77 --extra-args "--src-human bvh_ue5_native" --workers 4
+       --input-dir data/mytraversal --output-dir data/RetargetOutputs/mytraversal \
+       --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
+       --data-scale 0.77 \
+       --extra-args "--src-human bvh_ue5_g1scale --height-from-data" --workers 4
    ```
 
 4. Export terrain for a folder:
