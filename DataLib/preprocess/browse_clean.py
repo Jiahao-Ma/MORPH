@@ -27,7 +27,13 @@ Run from the Morph/ directory:
   python DataLib/preprocess/browse_clean.py --cat traversal_mantle
   python DataLib/preprocess/browse_clean.py --cat ground --limit 20
   python DataLib/preprocess/browse_clean.py --cat stairs --terrain-dir data/sample/terrain
+  python DataLib/preprocess/browse_clean.py --cat traversal_vault --viewer viser \
+      --terrain-dir data/MorphData_v1/terrain
   python DataLib/preprocess/browse_clean.py --all --shuffle
+
+--viewer mujoco (default) opens a native MuJoCo window. --viewer viser starts a
+web 3D server (http://localhost:<port>) that swaps terrain+robot in place on
+trajectory switch (no window relaunch, even with terrain). Needs `pip install viser`.
 """
 import sys
 import json
@@ -287,6 +293,30 @@ def build_model(terrain=None, xy_offset=None):
         wrapper.unlink(missing_ok=True)
 
 
+def make_seg(res):
+    """Build a per-clip view dict (recentered to pelvis origin) from a
+    retarget_segment result. Shared by the MuJoCo and viser viewers."""
+    q = res["qpos"]
+    xy = np.array([-q[0, 0], -q[0, 1], 0.0], dtype=np.float64)
+    qw = q[:, 3:7]
+    qxyzw = np.stack([qw[:, 1], qw[:, 2], qw[:, 3], qw[:, 0]], axis=1)
+    rot = R.from_quat(qxyzw).as_matrix()
+    n = q.shape[0]
+    lk = res["look_fwd_xy"]
+    have_look = lk is not None and lk.shape[0] >= n
+    dv = res["des_vel"]
+    have_dv = dv is not None and dv.shape[0] >= n
+    mi = res["move_input"]
+    have_mi = mi is not None and mi.shape[0] >= n and have_look
+    return dict(qpos=q, fps=res["fps"], n=n, xy_offset=xy,
+                viz_pos=q[:, :3] + xy, rot=rot,
+                pelvis_fwd=rot[:, :2, 0].astype(np.float32),
+                look=lk if have_look else None,
+                des_vel=dv if have_dv else None,
+                move_input=mi if have_mi else None,
+                have_look=have_look, have_desvel=have_dv,
+                have_moveinput=have_mi, terrain=res.get("terrain"))
+
 
 def run_viewer(playlist, start=0, traj_window=100, marker_step=10,
                terrain_dir=None, terrain_ground_z0=0.0):
@@ -301,28 +331,6 @@ def run_viewer(playlist, start=0, traj_window=100, marker_step=10,
 
     pf = Prefetcher(playlist, terrain_dir=terrain_dir,
                     terrain_ground_z0=terrain_ground_z0)
-
-    def make_seg(res):
-        q = res["qpos"]
-        xy = np.array([-q[0, 0], -q[0, 1], 0.0], dtype=np.float64)
-        qw = q[:, 3:7]
-        qxyzw = np.stack([qw[:, 1], qw[:, 2], qw[:, 3], qw[:, 0]], axis=1)
-        rot = R.from_quat(qxyzw).as_matrix()
-        n = q.shape[0]
-        lk = res["look_fwd_xy"]
-        have_look = lk is not None and lk.shape[0] >= n
-        dv = res["des_vel"]
-        have_dv = dv is not None and dv.shape[0] >= n
-        mi = res["move_input"]
-        have_mi = mi is not None and mi.shape[0] >= n and have_look
-        return dict(qpos=q, fps=res["fps"], n=n, xy_offset=xy,
-                    viz_pos=q[:, :3] + xy, rot=rot,
-                    pelvis_fwd=rot[:, :2, 0].astype(np.float32),
-                    look=lk if have_look else None,
-                    des_vel=dv if have_dv else None,
-                    move_input=mi if have_mi else None,
-                    have_look=have_look, have_desvel=have_dv,
-                    have_moveinput=have_mi, terrain=res.get("terrain"))
 
     def render_frame(viewer, data, model, seg, state):
         qpos = seg["qpos"][state["fi"]].copy()
@@ -550,6 +558,169 @@ def run_viewer(playlist, start=0, traj_window=100, marker_step=10,
         # else loop relaunches for the new idx
 
 
+def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
+                     terrain_dir=None, terrain_ground_z0=0.0, port=8080):
+    """Browse the cleaned segments in a viser web 3D viewer.
+
+    One persistent viser server; N/P (or the clip slider) switch trajectory by
+    swapping the G1 mesh, terrain mesh and trajectory line in-place — no window
+    relaunch, even with terrain. Ground plane always shown."""
+    import mujoco as mj  # type: ignore
+    import viser
+    from verify_pipeline import setup_g1_visual, update_g1_visual
+
+    # Retarget the first clip BEFORE starting the viser server. GMR's C-extension
+    # init is sensitive to other threads running concurrently, so we do the
+    # (single-threaded) retarget first, then bring up the web server.
+    pf = Prefetcher(playlist, terrain_dir=terrain_dir,
+                    terrain_ground_z0=terrain_ground_z0)
+    print(f"\n[retarget #{start}] {playlist[start]['name']} ...")
+    first = retarget_segment(playlist[start]["jsonl"], playlist[start]["meta"],
+                            playlist[start]["scale"], terrain_dir=terrain_dir,
+                            terrain_ground_z0=terrain_ground_z0)
+    with pf.lock:
+        pf.cache[start] = first
+        pf.cond.notify_all()
+    pf.request(start + 1)
+
+    server = viser.ViserServer(port=port)
+    server.scene.set_up_direction("+z")
+
+    # Ground plane + grid (fixed, large).
+    gv = np.array([[-12, -12, 0], [12, -12, 0], [12, 12, 0], [-12, 12, 0]],
+                  dtype=np.float32)
+    gf = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    server.scene.add_mesh_simple("/ground", gv, gf, color=(150, 150, 150),
+                                 opacity=0.45, side="double", flat_shading=True)
+    server.scene.add_grid("/grid", width=24.0, height=24.0)
+
+
+    cur = {"idx": start, "seg": None, "n": 0, "g1_handles": [], "g1_model": None,
+           "g1_data": None, "terrain_h": None, "traj_h": None, "cur_h": None,
+           "pending": None}
+
+    def make_seg_local(res):
+        return make_seg(res)
+
+    def load_segment(idx):
+        res = pf.get(idx)
+        seg = make_seg_local(res)
+        # remove previous clip's handles
+        if cur["terrain_h"] is not None:
+            cur["terrain_h"].remove(); cur["terrain_h"] = None
+        if cur["traj_h"] is not None:
+            cur["traj_h"].remove(); cur["traj_h"] = None
+        if cur["cur_h"] is not None:
+            cur["cur_h"].remove(); cur["cur_h"] = None
+        for h, _gid in cur["g1_handles"]:
+            h.remove()
+        # G1 robot mesh (retargeter's model, robot-only)
+        g1_model = res["g1_model"]
+        g1_data = mj.MjData(g1_model)
+        cur["g1_handles"] = setup_g1_visual(g1_model, server, prefix="/g1")
+        cur["g1_model"] = g1_model
+        cur["g1_data"] = g1_data
+        # terrain
+        if seg.get("terrain") is not None:
+            v = seg["terrain"][0].astype(np.float32).copy()
+            v[:, 0] += seg["xy_offset"][0]
+            v[:, 1] += seg["xy_offset"][1]
+            f = seg["terrain"][1].astype(np.int32)
+            cur["terrain_h"] = server.scene.add_mesh_simple(
+                "/terrain", v, f, color=(107, 168, 235), opacity=0.85,
+                side="double", flat_shading=True)
+        # full-clip trajectory line (static) + gold current marker
+        vp = seg["viz_pos"].astype(np.float32)
+        if vp.shape[0] >= 2:
+            seg_pts = np.stack([vp[:-1], vp[1:]], axis=1)
+            cur["traj_h"] = server.scene.add_line_segments(
+                "/traj", seg_pts, colors=(0.30, 0.55, 1.00), line_width=2.0)
+        cur["cur_h"] = server.scene.add_point_cloud(
+            "/cur", vp[:1], colors=(255, 180, 40), point_size=0.05,
+            point_shape="circle")
+        cur["idx"] = idx
+        cur["seg"] = seg
+        cur["n"] = seg["n"]
+        g_frame.value_max = max(0, seg["n"] - 1)
+        g_frame.value = 0
+        g_clip.value = idx + 1
+        g_name.value = playlist[idx]["name"]
+        g_dur.value = f"{seg['n']/seg['fps']:.1f}s  ({playlist[idx]['cat']})"
+        if seg.get("terrain") is not None:
+            g_terrain.value = "on"
+        elif terrain_dir:
+            g_terrain.value = "ground only (no terrain found)"
+        else:
+            g_terrain.value = "off (pass --terrain-dir)"
+
+    def render(fi):
+        seg = cur["seg"]
+        if seg is None:
+            return
+        fi = max(0, min(fi, seg["n"] - 1))
+        cur["g1_data"].qpos[:] = seg["qpos"][fi]
+        mj.mj_forward(cur["g1_model"], cur["g1_data"])
+        update_g1_visual(cur["g1_data"], cur["g1_handles"],
+                         seg["xy_offset"][:2], visible=g_show_g1.value)
+        if cur["cur_h"] is not None:
+            cur["cur_h"].points = seg["viz_pos"][fi:fi+1].astype(np.float32)
+        if cur["traj_h"] is not None:
+            cur["traj_h"].visible = g_show_traj.value
+        g_frame.value = fi
+
+    def request_clip(target):
+        if target < 0 or target >= len(playlist):
+            return
+        if pf.has(target):
+            cur["pending"] = target
+        else:
+            pf.request(target)
+            cur["pending"] = target
+            g_name.value = f"loading #{target+1} {playlist[target]['name']} ..."
+
+    # GUI controls.
+    g_clip = server.gui.add_slider("clip", 1, len(playlist), 1, start + 1)
+    g_frame = server.gui.add_slider("frame", 0, max(0, first["qpos"].shape[0] - 1), 1, 0)
+    g_play = server.gui.add_checkbox("play", False)
+    g_fps = server.gui.add_slider("fps", 1, 120, 1, 30)
+    g_show_traj = server.gui.add_checkbox("trajectory", True)
+    g_show_g1 = server.gui.add_checkbox("show G1", True)
+    g_name = server.gui.add_text("clip", "")
+    g_dur = server.gui.add_text("info", "")
+    g_terrain = server.gui.add_text("terrain", "")
+    server.gui.add_button("next (N)").on_click(lambda _: request_clip(cur["idx"] + 1))
+    server.gui.add_button("prev (P)").on_click(lambda _: request_clip(cur["idx"] - 1))
+    server.gui.add_markdown(
+        "**gold** = current pelvis &nbsp; | &nbsp; **blue line** = trajectory "
+        "&nbsp; | &nbsp; **blue mesh** = terrain &nbsp; | &nbsp; **grey** = ground")
+
+    g_clip.on_update(lambda _: request_clip(int(g_clip.value) - 1))
+
+    load_segment(start)
+    render(0)
+
+    _vp = getattr(server, "port", port)
+    print(f"\n[viser] http://localhost:{_vp}  — {len(playlist)} clips")
+    print("  Use the clip slider or next/prev buttons to jump trajectories. "
+          "Close with Ctrl-C.")
+
+    try:
+        while True:
+            if cur["pending"] is not None and pf.has(cur["pending"]):
+                t = cur["pending"]
+                cur["pending"] = None
+                load_segment(t)
+                pf.request(t + 1)
+                render(0)
+            fi = int(g_frame.value)
+            if g_play.value and cur["n"] > 1:
+                fi = (fi + 1) % cur["n"]
+                g_frame.value = fi
+            render(fi)
+            time.sleep(1.0 / float(g_fps.value) if g_play.value else 0.05)
+    except KeyboardInterrupt:
+        print("\n[viser] shutting down.")
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -578,6 +749,13 @@ def main():
     ap.add_argument("--terrain-ground-z0", type=float, default=0.0,
                     help="UE ground height (cm) used as the terrain z0 "
                          "reference (subtracted from UE Z). Default 0.")
+    ap.add_argument("--viewer", choices=["mujoco", "viser"], default="mujoco",
+                    help="Viewer backend. 'mujoco' = native MuJoCo window "
+                         "(default). 'viser' = web 3D viewer (needs `pip install "
+                         "viser`); one persistent server, terrain+robot swap in "
+                         "place on trajectory switch (no window relaunch).")
+    ap.add_argument("--port", type=int, default=8080,
+                    help="viser server port (default 8080).")
     args = ap.parse_args()
 
     cats = CATEGORIES if args.all else [args.cat]
@@ -588,14 +766,22 @@ def main():
         sys.exit(1)
     print(f"[playlist] {len(playlist)} segments across {cats}")
     if args.terrain_dir:
-        print(f"[terrain] dir={args.terrain_dir}  "
-              f"(per-clip viewer with terrain + ground)")
+        print(f"[terrain] dir={args.terrain_dir}  (terrain + ground)")
     else:
         print("[terrain] off (ground plane only). Pass --terrain-dir to add terrain.")
-    run_viewer(playlist, start=min(args.start, len(playlist) - 1),
-               traj_window=args.traj_window, marker_step=args.marker_step,
-               terrain_dir=args.terrain_dir,
-               terrain_ground_z0=args.terrain_ground_z0)
+    start = min(args.start, len(playlist) - 1)
+    if args.viewer == "viser":
+        run_viser_viewer(playlist, start=start,
+                         traj_window=args.traj_window,
+                         marker_step=args.marker_step,
+                         terrain_dir=args.terrain_dir,
+                         terrain_ground_z0=args.terrain_ground_z0,
+                         port=args.port)
+    else:
+        run_viewer(playlist, start=start,
+                   traj_window=args.traj_window, marker_step=args.marker_step,
+                   terrain_dir=args.terrain_dir,
+                   terrain_ground_z0=args.terrain_ground_z0)
 
 
 if __name__ == "__main__":

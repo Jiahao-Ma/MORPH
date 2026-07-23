@@ -23,7 +23,7 @@ result.
 | `rollback_clean.py` | Undoes an `apply_clean.py` swap using the rollback manifest. |
 | `eval_clean.py` | Evaluates a dataset: `disp/dt` speed thresholds, `dt` distribution, per-category duration. Run before **and** after cleaning. |
 | `seg_duration_dist.py` | Duration distribution of the cleaned segments (percentiles, histogram, PNG). |
-| `browse_clean.py` | Interactive MuJoCo G1 viewer that retargets each cleaned segment on the fly and lets you **jump between trajectories** with `N`/`P` keys (one persistent viewer, no re-launch per clip). |
+| `browse_clean.py` | Interactive G1 viewer that retargets each cleaned segment on the fly and lets you **jump between trajectories** with `N`/`P` (one persistent viewer, no re-launch per clip). `--viewer mujoco` (default, native window) or `--viewer viser` (web 3D server — swaps terrain+robot in place on switch, no window relaunch even with terrain). |
 | `assets/seg_duration_dist.png` | Duration-distribution plot for the cleaned v1 set. |
 
 ## Cleaning rules (per frame `k`, with a predecessor)
@@ -115,6 +115,22 @@ is not vendored — extract `MorphDataTerrain_v1.zip` into a folder and point
 `data/sample/terrain/`; `traversal_*` need the full set; `ground` has no
 terrain and shows ground only.) Requires a display and the `mujoco`/`mink`/
 `scipy` runtime deps.
+
+#### viser web viewer (`--viewer viser`)
+
+By default `browse_clean.py` opens the native **MuJoCo** window. Add
+`--viewer viser` (after `pip install viser`) to start a **web 3D server**
+instead — open the printed `http://localhost:<port>` URL in a browser. The viser
+backend keeps **one persistent server** and swaps the G1 mesh, terrain mesh and
+trajectory line **in place** when you switch clips, so — unlike the MuJoCo
+terrain mode — it does **not** relaunch the window per clip, even with terrain.
+The clip slider and the next/prev buttons jump trajectories (the next clip is
+pre-retargeted in a background thread, so switching is usually instant).
+
+```bash
+python DataLib/preprocess/browse_clean.py --cat traversal_vault --viewer viser \
+    --terrain-dir data/MorphData_v1/terrain --port 8080
+```
 
 ## Results on MorphData_v1 (v1)
 

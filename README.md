@@ -378,6 +378,12 @@ python DataLib/preprocess/browse_clean.py --cat traversal_mantle
 # stairs works with the shipped samples; traversal_* need MorphDataTerrain_v1.
 python DataLib/preprocess/browse_clean.py --cat stairs --terrain-dir data/sample/terrain
 
+# Browse in the viser web 3D viewer instead of the native MuJoCo window.
+# One persistent server; N/P (or the clip slider) swap terrain + robot in place
+# — no window relaunch even with terrain. Needs `pip install viser`.
+python DataLib/preprocess/browse_clean.py --cat traversal_vault --viewer viser \
+    --terrain-dir data/MorphData_v1/terrain --port 8080
+
 # Rollback if needed:
 python DataLib/preprocess/rollback_clean.py --data-root data/MorphData_v1
 ```
