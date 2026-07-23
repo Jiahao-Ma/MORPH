@@ -23,6 +23,7 @@ result.
 | `rollback_clean.py` | Undoes an `apply_clean.py` swap using the rollback manifest. |
 | `eval_clean.py` | Evaluates a dataset: `disp/dt` speed thresholds, `dt` distribution, per-category duration. Run before **and** after cleaning. |
 | `seg_duration_dist.py` | Duration distribution of the cleaned segments (percentiles, histogram, PNG). |
+| `browse_clean.py` | Interactive MuJoCo G1 viewer that retargets each cleaned segment on the fly and lets you **jump between trajectories** with `N`/`P` keys (one persistent viewer, no re-launch per clip). |
 | `assets/seg_duration_dist.png` | Duration-distribution plot for the cleaned v1 set. |
 
 ## Cleaning rules (per frame `k`, with a predecessor)
@@ -80,6 +81,31 @@ python DataLib/preprocess/rollback_clean.py --data-root data/MorphData_v1
 All paths are CLI-configurable; defaults are relative to the `Morph/` root.
 Tunables (`--stuck-dt`, `--big-gap-dt`, `--small-gap-dt`, `--mut-mps`,
 `--min-frames`, `--min-dur`) expose the rules above.
+
+### Browsing the cleaned segments (interactive viewer)
+
+`browse_clean.py` reuses the MORPH retarget pipeline to replay every cleaned
+segment as a G1 in one persistent MuJoCo viewer, with keys to **jump between
+trajectories** instead of one clip per launch:
+
+```bash
+# Browse one category (N = next clip, P = previous, Space = play/pause)
+python DataLib/preprocess/browse_clean.py --cat traversal_mantle
+
+# Cap / shuffle the playlist
+python DataLib/preprocess/browse_clean.py --cat ground --limit 20 --shuffle
+
+# Browse all categories back-to-back
+python DataLib/preprocess/browse_clean.py --all
+```
+
+Keys: `Space`=pause, `Left/Right`=step, `Backspace`=reset, **`N`=next
+trajectory**, **`P`=previous**, `T`=toggle trajectory overlay, `O`=toggle
+orientation arrows, `V`=toggle velocity arrows, `Esc`/`Q`=quit. The next
+segment is retargeted in a background thread while the current one plays, so
+jumping with `N` is usually instant. Terrain is off by default (the full
+terrain set is not vendored). Requires a display and the `mujoco`/`mink`/
+`scipy` runtime deps.
 
 ## Results on MorphData_v1 (v1)
 

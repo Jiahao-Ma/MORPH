@@ -73,8 +73,9 @@ Morph/
 │   │   ├── clean_morph.py                # dt-gap + disp/dt-speed cleaner (stages segments)
 │   │   ├── apply_clean.py                # swap staged segments into the dataset (backup + rollback)
 │   │   ├── rollback_clean.py             # undo an apply_clean.py swap
-│   │   ├── eval_clean.py                 # eval disp/dt speed / dt dist / duration (before & after)
+│   │   ├── eval_clean.py                # eval disp/dt speed / dt dist / duration (before & after)
 │   │   ├── seg_duration_dist.py          # duration distribution of cleaned segments
+│   │   ├── browse_clean.py               # interactive G1 viewer; N/P jump between trajectories
 │   │   └── README.md                     # rules, usage, before/after tables
 │   └── gmr/                              # vendored trimmed GMR (no torch/etc.)
 │       └── general_motion_retargeting/   # params, motion_retarget, neck_retarget, data_loader
@@ -369,6 +370,9 @@ python DataLib/preprocess/eval_clean.py --data-root data/MorphData_v1
 
 # 5. Duration distribution of the cleaned segments.
 python DataLib/preprocess/seg_duration_dist.py --data-root data/MorphData_v1
+
+# Browse the cleaned segments in one MuJoCo G1 viewer (N = next trajectory).
+python DataLib/preprocess/browse_clean.py --cat traversal_mantle
 
 # Rollback if needed:
 python DataLib/preprocess/rollback_clean.py --data-root data/MorphData_v1
