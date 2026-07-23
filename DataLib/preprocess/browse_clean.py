@@ -67,31 +67,6 @@ CATEGORY_SCALE = {
 CATEGORIES = list(CATEGORY_SCALE.keys())
 
 # When terrain is shown, keep only the faces inside the trajectory XY bbox +
-
-
-def _robust_human_height(gmr_frames):
-    """Estimate human height robustly across the whole clip, not just frame 0.
-
-    rt.estimate_human_height uses ONLY frame 0 (head_z - foot_z + 0.09). If the
-    clip starts in a crouch/tuck (e.g. mid-vault), frame 0 is the minimum and
-    the estimate is far too small — which shrinks the whole scaled skeleton and
-    the retargeted G1 (the '矮' clip bug). We take the p90 of the per-frame
-    head-over-feet height instead, which is immune to a crouched/jumping frame 0
-    and matches sibling clips that happen to start standing."""
-    if not gmr_frames:
-        return 1.7
-    hs = []
-    for f in gmr_frames:
-        head = f.get("head", [np.array([0.0, 0.0, 1.7])])[0]
-        fl = f.get("foot_l", [np.array([0.0, 0.0, 0.0])])[0]
-        fr = f.get("foot_r", [np.array([0.0, 0.0, 0.0])])[0]
-        hs.append(float(head[2] - min(fl[2], fr[2])))
-    if not hs:
-        return 1.7
-    return float(np.percentile(np.asarray(hs), 90) + 0.09)
-
-
-
 # this margin (m), so far-away terrain instances the clip never reaches are
 # hidden. Set by --terrain-margin. (visualize.py shows the whole terrain file;
 # browse_clean crops to the clip's path for a less cluttered view.)
@@ -125,7 +100,7 @@ def _crop_terrain(terrain, xy_pts, margin):
 
 
 def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
-                     height_from_data=True, terrain_dir=None,
+                     height_from_data=False, terrain_dir=None,
                      terrain_ground_z0=0.0):
     """Run the S5 retarget flow (same as ue_world_skeleton_retarget.main s5)
     and return the artifacts needed for visualization. No file export.
@@ -161,11 +136,22 @@ def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
         root_xy[:, 0] = rt.smooth_1d(root_xy[:, 0], smooth_win)
         root_xy[:, 1] = rt.smooth_1d(root_xy[:, 1], smooth_win)
 
+    # Human height is FIXED and known per source: ground/stairs are recorded
+    # with a G1-height character (mesh.s=0.77, data_scale=1.0); traversal is
+    # recorded with a UE character (mesh.s=1.0) then scaled 0.77 -> G1. After
+    # mesh.s * data-scale every clip is at the G1-scale height baked into the
+    # config (actual_human_height_m = 1.32), so we use that constant and do NOT
+    # estimate from the motion. The per-frame estimator is biased by
+    # non-standing poses (a crouched frame 0 shrinks the whole skeleton -> the
+    # '矮' clip bug); --height-from-data is only an escape hatch for
+    # non-standard data whose source height is genuinely unknown.
+    h_cfg = cfg.get("actual_human_height_m")
     if height_from_data:
-        h = _robust_human_height(gmr_frames)
+        h = rt.estimate_human_height(gmr_frames)
+    elif h_cfg is not None:
+        h = float(h_cfg)
     else:
-        h_cfg = cfg.get("actual_human_height_m")
-        h = float(h_cfg) if h_cfg is not None else _robust_human_height(gmr_frames)
+        h = rt.estimate_human_height(gmr_frames)
 
     name_to_idx = {nm: i for i, nm in enumerate(bone_names)}
     ball_idx = {nm: name_to_idx[nm] for nm in ("ball_l", "ball_r") if nm in name_to_idx}

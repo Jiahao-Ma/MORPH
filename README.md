@@ -146,9 +146,16 @@ pairing (`bvh_ue5_g1scale` + `gasp_bvh_alignment_g1_height.json`).
 
 Two more flags matter for output quality (both used by the tests):
 
-* `--height-from-data` — estimate the human height from the motion itself
-  (same as the verify_pipeline viewers) instead of the config constant, so
-  the export scale matches the verified diagnostic view.
+* `--height-from-data` — (off by default) estimate the human height from the
+  motion itself instead of using the config constant `actual_human_height_m`.
+  Do NOT enable this for this dataset: the source-character height is fixed
+  and known per category (ground/stairs recorded at G1 height; traversal
+  recorded at UE height then scaled 0.77 → G1), so after `mesh.s × data-scale`
+  every clip is already at the G1-scale height baked into
+  `gasp_bvh_alignment_g1_height.json` (`actual_human_height_m = 1.32`). The
+  per-frame estimator is biased by non-standing poses (a crouched frame 0
+  shrinks the whole skeleton — the '矮' clip bug) and is left in only as an
+  escape hatch for non-standard data.
 * `--smooth-win N` (default 9) — zero-phase temporal smoothing of the root
   XY trajectory and the grounding Δz, so raw per-frame capture noise does not
   feed 1:1 into the G1 pelvis. Set `0` to disable.
@@ -228,7 +235,7 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
        --meta  data/mytraversal/MyRec_meta.json \
        --terrain-dir data/sample/terrain \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
-       --src-human bvh_ue5_g1scale --data-scale 0.77 --height-from-data \
+       --src-human bvh_ue5_g1scale --data-scale 0.77 \
        --output-qpos data/RetargetOutputs/mytraversal/MyRec_frames.npy \
        --no-visualize
 
@@ -238,7 +245,7 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
        --meta  data/mystairs/MyRec_meta.json \
        --terrain-dir data/sample/terrain \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
-       --src-human bvh_ue5_g1scale --data-scale 1.0 --height-from-data \
+       --src-human bvh_ue5_g1scale --data-scale 1.0 \
        --output-qpos data/RetargetOutputs/mystairs/MyRec_frames.npy \
        --no-visualize
    ```
@@ -254,7 +261,7 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
        --input-dir data/mytraversal --output-dir data/RetargetOutputs/mytraversal \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
        --data-scale 0.77 --terrain-dir data/sample/terrain \
-       --extra-args "--src-human bvh_ue5_g1scale --height-from-data" --workers 4
+       --extra-args "--src-human bvh_ue5_g1scale" --workers 4
    ```
 
 4. Export terrain for a folder:

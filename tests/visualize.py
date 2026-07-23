@@ -51,7 +51,6 @@ def visualize(cat: str, rec_idx: int, mode: str, viewer: str) -> None:
             "--config", str(p["config"]),
             "--src-human", cfg["src_human"],
             "--data-scale", str(cfg["data_scale"]),
-            "--height-from-data",
             "--no-save",
         ]
         if p["terrain"] is not None:

@@ -1304,8 +1304,18 @@ def main():
             gmr_frames, root_xy = build_gmr_frames(
                 skel_mj, gasp_rot_all, bone_names, Rg, tg, delta,
                 recenter_root_xy=True)
-            h = estimate_human_height(gmr_frames)
-            print(f"  Estimated human height = {h:.3f} m")
+            # Human height is FIXED and known per source (ground/stairs at G1
+            # height; traversal UE->0.77->G1), so after mesh.s*data-scale every
+            # clip is at the G1-scale height baked into the config. Use that
+            # constant instead of estimating from the motion (a crouched frame
+            # 0 shrinks the whole skeleton -> the '矮' clip bug).
+            h_cfg = cfg.get("actual_human_height_m") if cfg is not None else None
+            if h_cfg is not None:
+                h = float(h_cfg)
+                print(f"  Human height = {h:.3f} m  (from config actual_human_height_m)")
+            else:
+                h = estimate_human_height(gmr_frames)
+                print(f"  Estimated human height = {h:.3f} m  (config missing -> frame-0 fallback)")
             print(f"  root XY range: X[{root_xy[:,0].min():.2f},"
                   f"{root_xy[:,0].max():.2f}]  "
                   f"Y[{root_xy[:,1].min():.2f},{root_xy[:,1].max():.2f}] m "
