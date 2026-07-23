@@ -983,10 +983,16 @@ def resolve_terrain_path(args) -> str | None:
         print("  [Terrain] meta has no terrain_ref; use --terrain.")
         return None
     meta_dir = pathlib.Path(args.meta).parent
-    for c in (meta_dir / "terrain" / ref, meta_dir / ref):
+    cands = []
+    if getattr(args, "terrain_dir", None):
+        cands.append(pathlib.Path(args.terrain_dir) / ref)
+    cands.append(meta_dir / "terrain" / ref)
+    cands.append(meta_dir / ref)
+    for c in cands:
         if c.is_file():
             return str(c)
-    print(f"  [Terrain] could not find {ref}")
+    print(f"  [Terrain] could not find {ref} "
+          f"(looked in {cands})")
     return None
 
 
@@ -1006,7 +1012,14 @@ def main():
     ap.add_argument("--meta", required=True)
     ap.add_argument("--config", default=None,
                     help="gasp_bvh_alignment.json. Required for kabsch / ball-align.")
-    ap.add_argument("--terrain", default=None)
+    ap.add_argument("--terrain", default=None,
+                    help="Explicit path to a terrain_<hash>.json. Default: "
+                         "resolved from the recording meta's terrain_ref, "
+                         "searched in --terrain-dir then next to --meta.")
+    ap.add_argument("--terrain-dir", default=None,
+                    help="Directory holding terrain_<hash>.json files. "
+                         "Default: a `terrain` folder next to --meta, then "
+                         "--meta's own folder.")
     ap.add_argument("--stage",
                     choices=["s1", "s3", "s4", "s5", "s5.1", "s5.2"],
                     default="s5",
@@ -1881,7 +1894,8 @@ def main():
         g_show_err_lines.on_update(lambda _: render(int(g_frame.value)))
     render(0)
 
-    print(f"\n[viser] http://localhost:{args.port}  — stage={args.stage}")
+    _vp = getattr(server, "port", args.port)
+    print(f"\n[viser] http://localhost:{_vp}  — stage={args.stage}")
     while True:
         if g_play.value and n_frames > 1:
             g_frame.value = (int(g_frame.value) + 1) % n_frames

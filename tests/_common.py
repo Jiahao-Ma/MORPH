@@ -20,22 +20,35 @@ GMR_DIR = DATALIB / "gmr"
 
 DATA = REPO / "data"
 SAMPLE = DATA / "sample"
+# All terrain_<hash>.json files live in one shared folder (one per unique
+# terrain hash; recordings reference theirs via meta.terrain_ref). Each
+# terrain-consuming script accepts --terrain-dir pointing here.
+SAMPLE_TERRAIN_DIR = SAMPLE / "terrain"
 OUTPUTS = DATA / "RetargetOutputs"
 
 PY = sys.executable
 
 # Per-category retarget configuration.
-#   stairs      : recorded with a G1-scaled UE character  -> src=bvh_ue5_g1scale, scale=1.0
-#   ground/trav : recorded with a 1.75 m (original) UE char -> src=bvh_ue5_native, scale=0.77
+#
+# The retarget pipeline reads world-space joint positions (wp), which already
+# include the in-engine character mesh scale (root.mesh.s in the JSONL):
+#   ground/stairs : recorded with mesh.s=0.77 (already G1 height) -> data_scale=1.0
+#   traversal     : recorded with mesh.s=1.0  (original height)   -> data_scale=0.77
+# After data_scale, everything is at G1 height, so every category uses the
+# G1-scale pairing: src=bvh_ue5_g1scale + gasp_bvh_alignment_g1_height.json.
+# (The old ground/traversal pairing of data_scale=0.77 + bvh_ue5_native +
+# gasp_bvh_alignment.json double-shrank ground and mis-scaled traversal,
+# forcing the IK against joint limits -> violent pelvis jitter.)
 #
 # Each category lists >=1 recording; all stairs recordings share terrain
-# E4B166AB and all traversal recordings share terrain 581C18B5, so only one
-# terrain_*.json per category is needed in data/sample/<cat>/.
+# E4B166AB and all traversal recordings share terrain 43D5EBED. The terrain
+# JSONs themselves live together in data/sample/terrain/ (one per hash), not
+# inside each category folder.
 CATEGORIES = {
     "ground": {
-        "src_human": "bvh_ue5_native",
-        "data_scale": 0.77,
-        "config": RETARGET_DIR / "gasp_bvh_alignment.json",
+        "src_human": "bvh_ue5_g1scale",
+        "data_scale": 1.0,
+        "config": RETARGET_DIR / "gasp_bvh_alignment_g1_height.json",
         "terrain_hash": None,
         "recordings": [
             "WalkTurnCrouch_C_10_Ovu0mkr5",
@@ -53,13 +66,12 @@ CATEGORIES = {
         ],
     },
     "traversal": {
-        "src_human": "bvh_ue5_native",
+        "src_human": "bvh_ue5_g1scale",
         "data_scale": 0.77,
-        "config": RETARGET_DIR / "gasp_bvh_alignment.json",
-        "terrain_hash": "581C18B5",
+        "config": RETARGET_DIR / "gasp_bvh_alignment_g1_height.json",
+        "terrain_hash": "43D5EBED",
         "recordings": [
-            "Traversal_C_163_5X5oWEQK",
-            "Traversal_C_164_HbggcUi1",
+            "Traversal_C_0_9TSt7kc8",
         ],
     },
 }
@@ -77,7 +89,9 @@ def sample_paths(cat: str, stem: str) -> dict:
         "jsonl": d / f"{stem}_frames.jsonl",
         "meta": d / f"{stem}_meta.json",
         "config": cfg["config"],
-        "terrain": (d / f"terrain_{cfg['terrain_hash']}.json") if has_terrain else None,
+        # Terrain JSONs now live in the shared data/sample/terrain/ folder.
+        "terrain": (SAMPLE_TERRAIN_DIR / f"terrain_{cfg['terrain_hash']}.json") if has_terrain else None,
+        "terrain_dir": SAMPLE_TERRAIN_DIR,
         "cfg": cfg,
         "stem": stem,
         "cat": cat,

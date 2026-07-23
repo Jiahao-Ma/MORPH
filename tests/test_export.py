@@ -29,14 +29,16 @@ def export_one(p: dict) -> None:
         "--config", str(p["config"]),
         "--src-human", cfg["src_human"],
         "--data-scale", str(cfg["data_scale"]),
+        "--height-from-data",
         "--output-qpos", str(out_qpos),
         "--no-visualize",
     ]
     # ground has no terrain; stairs/traversal load the sample terrain for viz
     # consistency (the export itself is terrain-independent, but loading it
-    # exercises the terrain path too).
+    # exercises the terrain path too). Terrain JSONs live in the shared
+    # data/sample/terrain/ folder, pointed at via --terrain-dir.
     if p["terrain"] is not None:
-        cmd += ["--terrain", str(p["terrain"])]
+        cmd += ["--terrain-dir", str(p["terrain_dir"])]
     else:
         cmd += ["--no-terrain"]
 

@@ -29,9 +29,10 @@ def batch_category(cat: str) -> None:
         "--output-dir", str(out_dir),
         "--config", str(p["config"]),
         "--data-scale", str(cfg["data_scale"]),
+        "--terrain-dir", str(p["terrain_dir"]),
         "--workers", "1",
-        # thread src-human through --extra-args
-        "--extra-args", f"--src-human {cfg['src_human']}",
+        # thread src-human + height mode through --extra-args
+        "--extra-args", f"--src-human {cfg['src_human']} --height-from-data",
     ]
     run(cmd, env=ensure_gmr_on_env(None))
 

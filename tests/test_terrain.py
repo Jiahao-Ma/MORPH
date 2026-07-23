@@ -15,7 +15,8 @@ Run:
 import pathlib
 
 from _common import (
-    CATEGORIES, OUTPUTS, PY, TERRAIN_DIR, run, sample_paths, check_files,
+    CATEGORIES, OUTPUTS, PY, TERRAIN_DIR, SAMPLE_TERRAIN_DIR,
+    run, sample_paths, check_files,
 )
 
 
@@ -24,7 +25,8 @@ def export_terrain(cat: str) -> None:
     if cfg["terrain_hash"] is None:
         print(f"[terrain {cat}] no terrain for this category, skipping.")
         return
-    # any recording's folder works — they share the terrain file
+    # any recording's config works — terrain files all live in the shared
+    # data/sample/terrain/ folder now.
     p = sample_paths(cat, cfg["recordings"][0])
     out_dir = OUTPUTS / "terrain"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -32,7 +34,7 @@ def export_terrain(cat: str) -> None:
 
     cmd = [
         PY, str(TERRAIN_DIR / "convert_terrain.py"),
-        "--terrain-dir", str(p["jsonl"].parent),
+        "--terrain-dir", str(SAMPLE_TERRAIN_DIR),
         "--config", str(p["config"]),
         "--output-dir", str(out_dir),
         "--name", name,

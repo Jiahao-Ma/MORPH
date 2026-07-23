@@ -493,6 +493,30 @@ def support_soft_ground_dz(blue_l_z: np.ndarray, blue_r_z: np.ndarray,
     return w_l * res_l + w_r * res_r
 
 
+def smooth_1d(x: np.ndarray, win: int) -> np.ndarray:
+    """Zero-phase temporal low-pass: Hann window + reflect padding.
+
+    Removes frame-to-frame noise without lagging the signal (symmetric
+    kernel). win is clamped to an odd value <= len(x); win < 3 returns x
+    unchanged. Used on the root XY trajectory and the grounding dz so raw
+    per-frame noise in the UE capture does not feed 1:1 into the G1 pelvis.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    win = int(win)
+    if win % 2 == 0:
+        win += 1
+    if win > n:
+        win = n if n % 2 == 1 else n - 1
+    if win < 3 or n < 3:
+        return x
+    kern = np.hanning(win + 2)[1:-1]
+    kern /= kern.sum()
+    pad = win // 2
+    xp = np.concatenate([x[pad:0:-1], x, x[-2:-pad - 2:-1]])
+    return np.convolve(xp, kern, mode="valid")
+
+
 def g1_fk_foot_z(model, qpos_arr, front_only=True):
     """Per-frame min foot contact sphere bottom Z via FK."""
     import mujoco as mj  # type: ignore
@@ -575,6 +599,23 @@ def g1_toe_fk_z(model, qpos_arr, toe_bodies=("left_toe_link", "right_toe_link"))
         mj.mj_forward(model, data)
         out[fi] = min(float(data.xpos[t, 2]) for t in toe_ids)
     return out
+
+
+def g1_toe_fk_z_lr(model, qpos_arr,
+                   toe_bodies=("left_toe_link", "right_toe_link")):
+    """Per-frame (left, right) toe_link world Z (live FK)."""
+    import mujoco as mj  # type: ignore
+    toe_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, b) for b in toe_bodies]
+    data = mj.MjData(model)
+    n = qpos_arr.shape[0]
+    out_l = np.zeros(n, dtype=np.float64)
+    out_r = np.zeros(n, dtype=np.float64)
+    for fi in range(n):
+        data.qpos[:] = qpos_arr[fi]
+        mj.mj_forward(model, data)
+        out_l[fi] = float(data.xpos[toe_ids[0], 2])
+        out_r[fi] = float(data.xpos[toe_ids[1], 2])
+    return out_l, out_r
 
 
 def per_foot_ground(model, qpos_arr, ball_l_z, ball_r_z,
@@ -671,11 +712,16 @@ def apply_s5_grounding(
     extra_drop: float,
     no_ball_align: bool,
     per_foot: bool,
+    ground_softness: float = 50.0,
+    smooth_win: int = 9,
 ):
     """verify_pipeline S5 main + per-foot grounding on the retargeted G1.
 
     (1) Root-Z grounding (toe-to-toe): a single per-frame root Z shift so the
         robot's (lower) toe-to-ground matches the human's (lower) toe-to-ground.
+        The support foot is picked with a soft-min blend (no hard left/right
+        min switch) and the resulting dz is temporally smoothed, so the raw
+        per-frame noise of the human ball Z does not feed 1:1 into pelvis Z.
     (2) Per-foot grounding: independently bend each leg so each toe_link lands
         on its own target (handles stairs / feet at different heights).
 
@@ -687,25 +733,39 @@ def apply_s5_grounding(
     offset_robot = g1_toe_standing_offset(g1_model)
 
     have_balls = "ball_l" in ball_idx and "ball_r" in ball_idx
-    ball_l_kabsch = ball_r_kabsch = ue_ball_min_z = None
+    ball_l_kabsch = ball_r_kabsch = None
     if have_balls:
         bl_s, br_s = ball_idx["ball_l"], ball_idx["ball_r"]
         ball_l_kabsch = skel_kabsch[:, bl_s, :]
         ball_r_kabsch = skel_kabsch[:, br_s, :]
-        ue_ball_min_z = np.minimum(ball_l_kabsch[:, 2], ball_r_kabsch[:, 2])
 
     if no_ball_align:
         print("[Root-Z grounding] DISABLED (--no-ball-align).")
     elif have_balls:
-        g1_toe_z_pre = g1_toe_fk_z(g1_model, qpos_arr)
-        dist_human = ue_ball_min_z - offset_human          # human ground
-        dist_robot = g1_toe_z_pre - offset_robot           # robot ground
-        dz = dist_human - dist_robot
+        g1_toe_l, g1_toe_r = g1_toe_fk_z_lr(g1_model, qpos_arr)
+        # Per-foot human/robot ground pairing + soft-min support blend
+        # (same method 3 as the pre-IK grounding; the support foot is the
+        # lower ROBOT toe). Replaces the old hard min() over both feet,
+        # whose left/right switches injected dz discontinuities into pelvis Z.
+        k = float(ground_softness)
+        dz = support_soft_ground_dz(
+            ball_l_kabsch[:, 2] - offset_human,     # human ground (L)
+            ball_r_kabsch[:, 2] - offset_human,     # human ground (R)
+            g1_toe_l - offset_robot,                # robot ground (L)
+            g1_toe_r - offset_robot,                # robot ground (R)
+            k)
+        dz_raw_std = float(np.std(np.diff(dz))) if len(dz) > 1 else 0.0
+        if smooth_win >= 3:
+            dz = smooth_1d(dz, smooth_win)
+        dz_sm_std = float(np.std(np.diff(dz))) if len(dz) > 1 else 0.0
         qpos_arr[:, 2] += dz
         print(f"[Root-Z grounding] offset_human={offset_human:.3f} m  "
-              f"offset_robot(URDF)={offset_robot:.4f} m")
+              f"offset_robot(URDF)={offset_robot:.4f} m  "
+              f"(soft-min k={k:g}, smooth_win={smooth_win})")
         print(f"  Δz: min={dz.min():.4f}  med={np.median(dz):.4f}  "
               f"max={dz.max():.4f}  std={dz.std():.4f}")
+        print(f"  Δz frame-to-frame std: raw={dz_raw_std*100:.3f} cm "
+              f"-> smoothed={dz_sm_std*100:.3f} cm")
 
     if per_foot and have_balls:
         qpos_arr = per_foot_ground(
@@ -1988,6 +2048,20 @@ def main():
                     help="After Root-Z grounding, independently bend each leg so "
                          "each foot lands on its own target ground (handles "
                          "stairs / feet at different heights).")
+    ap.add_argument("--height-from-data", action="store_true",
+                    help="Estimate the human height from the motion data "
+                         "(frame-0 head-to-foot heuristic), exactly like "
+                         "verify_pipeline.py / verify_pipeline_scaled.py, "
+                         "instead of the calibrated 'actual_human_height_m' "
+                         "from --config. Keeps the export scale consistent "
+                         "with the verified diagnostic viewers.")
+    ap.add_argument("--smooth-win", type=int, default=9,
+                    help="Temporal smoothing window (frames, odd, zero-phase "
+                         "Hann) applied to (a) the root XY trajectory added "
+                         "back to qpos after the IK and (b) the pre-/post-IK "
+                         "grounding dz. Removes the raw per-frame capture "
+                         "noise that otherwise feeds 1:1 into the G1 pelvis. "
+                         "Default 9 (~0.15 s at 60 Hz). Set 0 to disable.")
     ap.add_argument("--no-trajectory", action="store_true",
                     help="Hide the pelvis trajectory overlay in the viewer.")
     ap.add_argument("--traj-window", type=int, default=100,
@@ -2103,11 +2177,30 @@ def main():
         R_global, t_global, delta,
         recenter_root_xy=True,
     )
-    # Prefer the canonical BVH-rest height baked into the calibration config.
-    # Falls back to a per-frame heuristic only if the config predates v1.1, in
-    # which case the height may be wrong (causes feet-through-floor).
+    # Low-pass the root XY trajectory that will be added back to qpos after
+    # the IK (and used to place the exported pre-IK skeleton). The IK input is
+    # root-recentered, so this removes the common-mode per-frame noise of the
+    # raw UE pelvis XY without touching the relative limb motion.
+    smooth_win = int(args.smooth_win)
+    if smooth_win >= 3 and root_xy.shape[0] >= 3:
+        xy_raw_std = float(np.std(np.diff(root_xy, axis=0)))
+        root_xy = root_xy.copy()
+        root_xy[:, 0] = smooth_1d(root_xy[:, 0], smooth_win)
+        root_xy[:, 1] = smooth_1d(root_xy[:, 1], smooth_win)
+        xy_sm_std = float(np.std(np.diff(root_xy, axis=0)))
+        print(f"  root XY smoothed (win={smooth_win}): frame-to-frame std "
+              f"{xy_raw_std*100:.3f} -> {xy_sm_std*100:.3f} cm")
+
+    # Human height reference. --height-from-data reproduces the (visually
+    # verified) verify_pipeline behavior: estimate from the motion itself.
+    # Otherwise prefer the canonical BVH-rest height baked into the config
+    # (falling back to the estimate if the config predates v1.1).
     h_cfg = cfg.get("actual_human_height_m")
-    if h_cfg is not None:
+    if args.height_from_data:
+        h = estimate_human_height(gmr_frames)
+        print(f"  Using data-estimated human_height = {h:.3f} m  "
+              f"(--height-from-data, same as verify_pipeline)")
+    elif h_cfg is not None:
         h = float(h_cfg)
         print(f"  Using calibrated human_height = {h:.3f} m  (from config)")
     else:
@@ -2155,6 +2248,8 @@ def main():
                 red_l, red_r = scaled_toe_tmp[:, 0, 2], scaled_toe_tmp[:, 1, 2]
                 dz_target = support_soft_ground_dz(blue_l, blue_r,
                                                    red_l, red_r, k)
+                if smooth_win >= 3:
+                    dz_target = smooth_1d(dz_target, smooth_win)
                 s_root = float(_retargeter_probe.human_scale_table.get(
                     _retargeter_probe.human_root_name, 1.0))
                 if abs(s_root) > 1e-8:
@@ -2197,6 +2292,8 @@ def main():
             extra_drop=args.extra_drop,
             no_ball_align=args.no_ball_align,
             per_foot=args.per_foot_ground,
+            ground_softness=args.ground_softness,
+            smooth_win=smooth_win,
         )
     except Exception as e:
         print(f"  [S5 grounding] FAILED ({type(e).__name__}: {e}); skip.")

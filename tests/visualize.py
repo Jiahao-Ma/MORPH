@@ -11,7 +11,7 @@ Two viewers are available:
   --mode verify
       Runs the richer diagnostic viewer:
         stairs      -> verify_pipeline.py          (already G1-scaled data)
-        ground/trav -> verify_pipeline_scaled.py   (--data-scale 0.77)
+        ground/trav -> verify_pipeline_scaled.py   (category --data-scale)
       These show the raw UE skeleton, the Kabsch-aligned skeleton and the
       retargeted G1 side by side through the pipeline stages. Backend defaults
       to --viewer mujoco (no extra deps); use --viewer viser after
@@ -51,10 +51,11 @@ def visualize(cat: str, rec_idx: int, mode: str, viewer: str) -> None:
             "--config", str(p["config"]),
             "--src-human", cfg["src_human"],
             "--data-scale", str(cfg["data_scale"]),
+            "--height-from-data",
             "--no-save",
         ]
         if p["terrain"] is not None:
-            cmd += ["--terrain", str(p["terrain"])]
+            cmd += ["--terrain-dir", str(p["terrain_dir"])]
         else:
             cmd += ["--no-terrain"]
         run(cmd, env=env)
@@ -71,7 +72,7 @@ def visualize(cat: str, rec_idx: int, mode: str, viewer: str) -> None:
             if p["config"]:
                 cmd += ["--config", str(p["config"])]
             if p["terrain"] is not None:
-                cmd += ["--terrain", str(p["terrain"])]
+                cmd += ["--terrain-dir", str(p["terrain_dir"])]
         else:
             script = RETARGET_DIR / "verify_pipeline_scaled.py"
             cmd = [
@@ -85,7 +86,7 @@ def visualize(cat: str, rec_idx: int, mode: str, viewer: str) -> None:
             if p["config"]:
                 cmd += ["--config", str(p["config"])]
             if p["terrain"] is not None:
-                cmd += ["--terrain", str(p["terrain"])]
+                cmd += ["--terrain-dir", str(p["terrain_dir"])]
         run(cmd, env=env)
     else:
         raise ValueError(f"unknown mode: {mode}")

@@ -70,6 +70,7 @@ def run_retarget(
     extra_args: list[str],
     timeout: int = 3600,
     data_scale: float = 1.0,
+    terrain_dir: str | None = None,
 ) -> tuple[str, bool, str, float]:
     """Run the retarget script on a single recording. Returns (stem, success, message, elapsed_sec)."""
     stem = output_npy.stem
@@ -85,6 +86,8 @@ def run_retarget(
     ] + extra_args
     if abs(float(data_scale) - 1.0) > 1e-9:
         cmd += ["--data-scale", str(data_scale)]
+    if terrain_dir:
+        cmd += ["--terrain-dir", str(terrain_dir)]
 
     t_start = time.time()
     try:
@@ -92,6 +95,8 @@ def run_retarget(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         elapsed = time.time() - t_start
@@ -141,6 +146,13 @@ def main():
                          "and 1.0 for already-G1-scaled recordings (stairs). "
                          "Forwarded to ue_world_skeleton_retarget.py --data-scale. "
                          "Default 1.0.")
+    ap.add_argument("--terrain-dir", default=None,
+                    help="Directory holding terrain_<hash>.json files. Forwarded "
+                         "to ue_world_skeleton_retarget.py --terrain-dir so the "
+                         "retarget/viz terrain is resolved from a single shared "
+                         "folder instead of next to each recording. Default: none "
+                         "(the retarget script falls back to a `terrain` folder "
+                         "next to each --meta).")
 
     args = ap.parse_args()
 
@@ -166,6 +178,8 @@ def main():
     print(f"  Extra:   {extra_args if extra_args else '(none)'}")
     print(f"  Workers: {args.workers}")
     print(f"  Data scale: {args.data_scale}")
+    if args.terrain_dir:
+        print(f"  Terrain dir: {args.terrain_dir}")
     print()
 
     pairs = find_recording_pairs(input_dir)
@@ -191,7 +205,7 @@ def main():
             print(f"  [SKIP] {stem} (output exists)")
             continue
 
-        tasks.append((meta, frames, output_npy, config, extra_args, args.timeout, args.data_scale))
+        tasks.append((meta, frames, output_npy, config, extra_args, args.timeout, args.data_scale, args.terrain_dir))
 
     if not tasks:
         print("\nAll recordings already processed. Nothing to do.")
@@ -199,7 +213,7 @@ def main():
 
     if args.dry_run:
         print(f"\n[DRY RUN] Would process {len(tasks)} recording(s):")
-        for meta, frames, output_npy, _, _, _, _ in tasks:
+        for meta, frames, output_npy, _, _, _, _, _ in tasks:
             print(f"  {frames.name} -> {output_npy.name}")
         return
 
@@ -211,11 +225,11 @@ def main():
 
     if args.workers <= 1:
         # Sequential
-        for i, (meta, frames, output_npy, cfg, extra, timeout, dscale) in enumerate(tasks, 1):
+        for i, (meta, frames, output_npy, cfg, extra, timeout, dscale, tdir) in enumerate(tasks, 1):
             stem = output_npy.stem
             size_mb = frames.stat().st_size / (1024 * 1024)
             print(f"[{i}/{len(tasks)}] {stem} ({size_mb:.0f} MB) ...", flush=True)
-            _, ok, msg, elapsed_file = run_retarget(meta, frames, output_npy, cfg, extra, timeout, dscale)
+            _, ok, msg, elapsed_file = run_retarget(meta, frames, output_npy, cfg, extra, timeout, dscale, tdir)
             if ok:
                 print(f"         [OK] done in {elapsed_file:.1f}s")
                 success_count += 1
@@ -226,8 +240,8 @@ def main():
         # Parallel
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             futures = {}
-            for meta, frames, output_npy, cfg, extra, timeout, dscale in tasks:
-                fut = executor.submit(run_retarget, meta, frames, output_npy, cfg, extra, timeout, dscale)
+            for meta, frames, output_npy, cfg, extra, timeout, dscale, tdir in tasks:
+                fut = executor.submit(run_retarget, meta, frames, output_npy, cfg, extra, timeout, dscale, tdir)
                 futures[fut] = output_npy.stem
 
             for fut in as_completed(futures):

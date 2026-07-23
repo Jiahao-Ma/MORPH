@@ -32,6 +32,12 @@ per-frame).
 Full v1 data: [`MorphData_v1.zip`](https://pan.baidu.com/s/1skKd-Ds431xWPmUoKSicIQ)
 (Baidu Netdisk, extract code: `md7d`).
 
+Terrain meshes (the `terrain_<hash>.json` scene exports for every recording in
+the v1 set, used by the retarget / viz pipeline): [`MorphDataTerrain_v1.zip`](https://pan.baidu.com/s/1smKxBp1n72U4CifP7BHZvQ)
+(Baidu Netdisk, extract code: `ajpw`). Drop the extracted `terrain_*.json`
+files into `data/sample/terrain/` (or point `--terrain-dir` at the folder you
+extract them to).
+
 This repo ships trimmed samples under `data/sample/` only; the full v1 set is
 not vendored here.
 
@@ -61,8 +67,9 @@ Morph/
 ├── data/
 │   ├── sample/                           # 2 trimmed recordings per category (~1200 frames, ~28 MB each)
 │   │   ├── ground/                       # flat-ground walk (no terrain)
-│   │   ├── stairs/                       # stair climb + terrain_E4B166AB.json
-│   │   └── traversal/                    # mantle traversal + terrain_581C18B5.json
+│   │   ├── stairs/                       # stair climb recordings (motion only)
+│   │   ├── traversal/                    # mantle traversal recordings (motion only)
+│   │   └── terrain/                      # shared terrain_<hash>.json for all categories
 │   └── RetargetOutputs/                  # generated exports (gitignored-ish; tests write here)
 ├── tests/                                # end-to-end reproducibility tests
 │   ├── _common.py
@@ -190,15 +197,19 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
 ## 6. Running on your own data
 
 1. Drop your recordings under `data/` — one folder per category, each
-   containing `<stem>_frames.jsonl` + `<stem>_meta.json` pairs (and, for
-   stairs/traversal, the referenced `terrain_<hash>.json`).
-2. Export a single recording:
+   containing `<stem>_frames.jsonl` + `<stem>_meta.json` pairs. Put the
+   referenced `terrain_<hash>.json` files together in one shared folder
+   (e.g. `data/sample/terrain/`); each recording's `meta.json` points at its
+   terrain via `terrain_ref`.
+2. Export a single recording (pass the shared terrain folder with
+   `--terrain-dir` so the viz terrain is loaded for context):
 
    ```bash
    # recording captured at the original UE height (root.mesh.s == 1.0)
    python DataLib/retarget/ue_world_skeleton_retarget.py \
        --jsonl data/mytraversal/MyRec_frames.jsonl \
        --meta  data/mytraversal/MyRec_meta.json \
+       --terrain-dir data/sample/terrain \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
        --src-human bvh_ue5_g1scale --data-scale 0.77 --height-from-data \
        --output-qpos data/RetargetOutputs/mytraversal/MyRec_frames.npy \
@@ -208,19 +219,24 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
    python DataLib/retarget/ue_world_skeleton_retarget.py \
        --jsonl data/mystairs/MyRec_frames.jsonl \
        --meta  data/mystairs/MyRec_meta.json \
+       --terrain-dir data/sample/terrain \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
        --src-human bvh_ue5_g1scale --data-scale 1.0 --height-from-data \
        --output-qpos data/RetargetOutputs/mystairs/MyRec_frames.npy \
        --no-visualize
    ```
 
-3. Batch a whole folder (one category per invocation):
+   (`--terrain <path>` also works to point at a single terrain file
+   explicitly; `--no-terrain` skips terrain entirely.)
+
+3. Batch a whole folder (one category per invocation). `--terrain-dir` is
+   forwarded to each retarget run:
 
    ```bash
    python DataLib/batch/batch_retarget.py \
        --input-dir data/mytraversal --output-dir data/RetargetOutputs/mytraversal \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
-       --data-scale 0.77 \
+       --data-scale 0.77 --terrain-dir data/sample/terrain \
        --extra-args "--src-human bvh_ue5_g1scale --height-from-data" --workers 4
    ```
 
@@ -228,7 +244,7 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
 
    ```bash
    python DataLib/terrain/convert_terrain.py \
-       --terrain-dir data/mystairs \
+       --terrain-dir data/sample/terrain \
        --config DataLib/retarget/gasp_bvh_alignment_g1_height.json \
        --output-dir data/RetargetOutputs/terrain --name mystairs
    ```
@@ -273,3 +289,7 @@ Terrain (per `--name`):
 * Sample recordings are trimmed to the first 1200 frames (~28 MB each, 20 s
   @ 60 Hz) of the full captures, two per category, so the repo stays
   cloneable; the pipeline behaves identically on full recordings.
+* Terrain JSONs are kept together in `data/sample/terrain/` (one file per
+  unique terrain hash) rather than duplicated inside each category folder.
+  Every terrain-consuming script takes a `--terrain-dir` pointing there;
+  recordings resolve theirs from `meta.json`'s `terrain_ref`.
