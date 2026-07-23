@@ -658,10 +658,16 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
         if seg is None:
             return
         fi = max(0, min(fi, seg["n"] - 1))
-        cur["g1_data"].qpos[:] = seg["qpos"][fi]
+        # Recenter exactly like the working reference (visualize_g1): shift the
+        # pelvis by xy_offset BEFORE fk, then render geoms with no extra offset.
+        # (Passing xy_offset to update_g1_visual would SUBTRACT it — wrong sign —
+        # and strand the robot at 2*frame0_xy, far from the terrain/trajectory.)
+        qpos = seg["qpos"][fi].copy()
+        qpos[:3] += seg["xy_offset"]
+        cur["g1_data"].qpos[:] = qpos
         mj.mj_forward(cur["g1_model"], cur["g1_data"])
         update_g1_visual(cur["g1_data"], cur["g1_handles"],
-                         seg["xy_offset"][:2], visible=g_show_g1.value)
+                         np.zeros(2), visible=g_show_g1.value)
         if cur["cur_h"] is not None:
             cur["cur_h"].points = seg["viz_pos"][fi:fi+1].astype(np.float32)
         if cur["traj_h"] is not None:
