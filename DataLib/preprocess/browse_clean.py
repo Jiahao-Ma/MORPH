@@ -67,6 +67,31 @@ CATEGORY_SCALE = {
 CATEGORIES = list(CATEGORY_SCALE.keys())
 
 # When terrain is shown, keep only the faces inside the trajectory XY bbox +
+
+
+def _robust_human_height(gmr_frames):
+    """Estimate human height robustly across the whole clip, not just frame 0.
+
+    rt.estimate_human_height uses ONLY frame 0 (head_z - foot_z + 0.09). If the
+    clip starts in a crouch/tuck (e.g. mid-vault), frame 0 is the minimum and
+    the estimate is far too small — which shrinks the whole scaled skeleton and
+    the retargeted G1 (the '矮' clip bug). We take the p90 of the per-frame
+    head-over-feet height instead, which is immune to a crouched/jumping frame 0
+    and matches sibling clips that happen to start standing."""
+    if not gmr_frames:
+        return 1.7
+    hs = []
+    for f in gmr_frames:
+        head = f.get("head", [np.array([0.0, 0.0, 1.7])])[0]
+        fl = f.get("foot_l", [np.array([0.0, 0.0, 0.0])])[0]
+        fr = f.get("foot_r", [np.array([0.0, 0.0, 0.0])])[0]
+        hs.append(float(head[2] - min(fl[2], fr[2])))
+    if not hs:
+        return 1.7
+    return float(np.percentile(np.asarray(hs), 90) + 0.09)
+
+
+
 # this margin (m), so far-away terrain instances the clip never reaches are
 # hidden. Set by --terrain-margin. (visualize.py shows the whole terrain file;
 # browse_clean crops to the clip's path for a less cluttered view.)
@@ -137,10 +162,10 @@ def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
         root_xy[:, 1] = rt.smooth_1d(root_xy[:, 1], smooth_win)
 
     if height_from_data:
-        h = rt.estimate_human_height(gmr_frames)
+        h = _robust_human_height(gmr_frames)
     else:
         h_cfg = cfg.get("actual_human_height_m")
-        h = float(h_cfg) if h_cfg is not None else rt.estimate_human_height(gmr_frames)
+        h = float(h_cfg) if h_cfg is not None else _robust_human_height(gmr_frames)
 
     name_to_idx = {nm: i for i, nm in enumerate(bone_names)}
     ball_idx = {nm: name_to_idx[nm] for nm in ("ball_l", "ball_r") if nm in name_to_idx}
@@ -229,6 +254,7 @@ def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
     return dict(qpos=qpos_arr, fps=fps, look_fwd_xy=look_fwd_xy,
                 des_vel=des_vel, move_input=move_input, g1_model=g1_model,
                 terrain=terrain,
+                human_height=h,
                 scaled_skel=scaled_skel, scaled_names=scaled_names,
                 scaled_toe=scaled_toe,
                 kabsch_skel=skel_kabsch, kabsch_names=bone_names)
@@ -759,6 +785,7 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
         g_frame.value = 0
         cur["loading"] = True        # suppress on_update while we move the slider
         g_clip.value = idx + 1
+        g_clip_num.value = idx + 1
         cur["loading"] = False
         cur["clip_target"] = None
         g_name.value = playlist[idx]["name"]
@@ -832,6 +859,11 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
 
     # GUI controls.
     g_clip = server.gui.add_slider("clip", 1, len(playlist), 1, start + 1)
+    # Direct clip entry: type a clip number and press enter/commit. This is the
+    # practical way to jump to one of thousands of clips (a step-1 slider over
+    # 4000+ values is hard to land on an exact clip).
+    g_clip_num = server.gui.add_number("go to clip #", start + 1,
+                                      min=1, max=len(playlist), step=1)
     g_frame = server.gui.add_slider("frame", 0, max(0, first["qpos"].shape[0] - 1), 1, 0)
     g_play = server.gui.add_checkbox("play", False)
     g_fps = server.gui.add_slider("fps", 1, 120, 1, 30)
@@ -865,6 +897,15 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
         cur["clip_target"] = (int(g_clip.value) - 1, time.time())
 
     g_clip.on_update(_on_clip_slider)
+
+    def _on_clip_num(_):
+        if cur["loading"]:
+            return
+        v = int(g_clip_num.value)
+        if 1 <= v <= len(playlist):
+            request_clip(v - 1)
+
+    g_clip_num.on_update(_on_clip_num)
 
     load_segment(start)
     render(0)
