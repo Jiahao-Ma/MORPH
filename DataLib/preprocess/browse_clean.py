@@ -112,17 +112,25 @@ def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
 
     name_to_idx = {nm: i for i, nm in enumerate(bone_names)}
     ball_idx = {nm: name_to_idx[nm] for nm in ("ball_l", "ball_r") if nm in name_to_idx}
+    scaled_skel = None
+    scaled_names = None
+    scaled_toe = None
     try:
-        _scaled, _names, probe, toe = rt.scaled_human_skeleton(
+        scaled_skel, scaled_names, probe, scaled_toe = rt.scaled_human_skeleton(
             gmr_frames, h, root_xy, src_human=SRC_HUMAN)
-        if "ball_l" in ball_idx and "ball_r" in ball_idx and np.isfinite(toe).all():
+        if "ball_l" in ball_idx and "ball_r" in ball_idx and np.isfinite(scaled_toe).all():
             k = 50.0
             blue_l = skel_kabsch[:, ball_idx["ball_l"], 2]
             blue_r = skel_kabsch[:, ball_idx["ball_r"], 2]
-            red_l, red_r = toe[:, 0, 2], toe[:, 1, 2]
+            red_l, red_r = scaled_toe[:, 0, 2], scaled_toe[:, 1, 2]
             dz = rt.support_soft_ground_dz(blue_l, blue_r, red_l, red_r, k)
             if smooth_win >= 3:
                 dz = rt.smooth_1d(dz, smooth_win)
+            # Ground the visualised scaled skeleton + toe in Z (world units),
+            # matching verify_pipeline s5.1, so the red IK-input sits on the
+            # terrain instead of sinking through it.
+            scaled_skel[:, :, 2] += dz[:, None]
+            scaled_toe[:, :, 2] += dz[:, None]
             s_root = float(probe.human_scale_table.get(probe.human_root_name, 1.0))
             if abs(s_root) > 1e-8:
                 dz_input = dz / s_root
@@ -188,7 +196,10 @@ def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
                 terrain = None
     return dict(qpos=qpos_arr, fps=fps, look_fwd_xy=look_fwd_xy,
                 des_vel=des_vel, move_input=move_input, g1_model=g1_model,
-                terrain=terrain)
+                terrain=terrain,
+                scaled_skel=scaled_skel, scaled_names=scaled_names,
+                scaled_toe=scaled_toe,
+                kabsch_skel=skel_kabsch, kabsch_names=bone_names)
 
 
 def build_playlist(cats, data_root=DATA_ROOT, limit=None, shuffle=False, seed=0):
@@ -308,6 +319,16 @@ def make_seg(res):
     have_dv = dv is not None and dv.shape[0] >= n
     mi = res["move_input"]
     have_mi = mi is not None and mi.shape[0] >= n and have_look
+
+    def _rc(arr):
+        """Recenter an (..., 3) world-frame array to the pelvis origin (XY only)."""
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype=np.float64).copy()
+        a[..., 0] += xy[0]
+        a[..., 1] += xy[1]
+        return a
+
     return dict(qpos=q, fps=res["fps"], n=n, xy_offset=xy,
                 viz_pos=q[:, :3] + xy, rot=rot,
                 pelvis_fwd=rot[:, :2, 0].astype(np.float32),
@@ -315,7 +336,12 @@ def make_seg(res):
                 des_vel=dv if have_dv else None,
                 move_input=mi if have_mi else None,
                 have_look=have_look, have_desvel=have_dv,
-                have_moveinput=have_mi, terrain=res.get("terrain"))
+                have_moveinput=have_mi, terrain=res.get("terrain"),
+                scaled_skel=_rc(res.get("scaled_skel")),
+                scaled_names=res.get("scaled_names"),
+                scaled_toe=_rc(res.get("scaled_toe")),
+                kabsch_skel=_rc(res.get("kabsch_skel")),
+                kabsch_names=res.get("kabsch_names"))
 
 
 def run_viewer(playlist, start=0, traj_window=100, marker_step=10,
@@ -567,7 +593,15 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
     relaunch, even with terrain. Ground plane always shown."""
     import mujoco as mj  # type: ignore
     import viser
-    from verify_pipeline import setup_g1_visual, update_g1_visual
+    from verify_pipeline import (setup_g1_visual, update_g1_visual,
+                                SCALED_BONE_CONNECTIONS, BONE_CONNECTIONS)
+
+    def _bone_pairs(connections, names):
+        """Resolve a list of (a, b) bone-name pairs to index pairs."""
+        n2i = {nm: i for i, nm in enumerate(names)} if names is not None else {}
+        pairs = [(n2i[a], n2i[b]) for a, b in connections
+                 if a in n2i and b in n2i]
+        return np.asarray(pairs, dtype=np.int64) if pairs else None
 
     # Retarget the first clip BEFORE starting the viser server. GMR's C-extension
     # init is sensitive to other threads running concurrently, so we do the
@@ -597,10 +631,19 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
 
     cur = {"idx": start, "seg": None, "n": 0, "g1_handles": [], "g1_model": None,
            "g1_data": None, "terrain_h": None, "traj_h": None, "cur_h": None,
-           "pending": None}
+           "pending": None,
+           "scaled_joints_h": None, "scaled_bones_h": None, "scaled_toe_h": None,
+           "scaled_bp": None,
+           "kabsch_joints_h": None, "kabsch_bones_h": None, "kabsch_bp": None}
 
     def make_seg_local(res):
         return make_seg(res)
+
+    def _remove_skel_handles():
+        for k in ("scaled_joints_h", "scaled_bones_h", "scaled_toe_h",
+                  "kabsch_joints_h", "kabsch_bones_h"):
+            if cur[k] is not None:
+                cur[k].remove(); cur[k] = None
 
     def load_segment(idx):
         res = pf.get(idx)
@@ -614,6 +657,7 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
             cur["cur_h"].remove(); cur["cur_h"] = None
         for h, _gid in cur["g1_handles"]:
             h.remove()
+        _remove_skel_handles()
         # G1 robot mesh (retargeter's model, robot-only)
         g1_model = res["g1_model"]
         g1_data = mj.MjData(g1_model)
@@ -634,10 +678,44 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
         if vp.shape[0] >= 2:
             seg_pts = np.stack([vp[:-1], vp[1:]], axis=1)
             cur["traj_h"] = server.scene.add_line_segments(
-                "/traj", seg_pts, colors=(0.30, 0.55, 1.00), line_width=2.0)
+                "/traj", seg_pts, colors=(0.0, 0.75, 0.75), line_width=2.0)
         cur["cur_h"] = server.scene.add_point_cloud(
             "/cur", vp[:1], colors=(255, 180, 40), point_size=0.05,
             point_shape="circle")
+        # scaled "IK-input" human skeleton (red) + un-scaled Kabsch overlay (blue)
+        # — same as verify_pipeline --stage s5.1.
+        sk = seg.get("scaled_skel")
+        if sk is not None and seg.get("scaled_names"):
+            cur["scaled_bp"] = _bone_pairs(SCALED_BONE_CONNECTIONS,
+                                           seg["scaled_names"])
+            cur["scaled_joints_h"] = server.scene.add_point_cloud(
+                "/scaled/joints", sk[0].astype(np.float32),
+                colors=(220, 30, 60), point_size=0.025, point_shape="circle")
+            if cur["scaled_bp"] is not None:
+                bp = cur["scaled_bp"]
+                cur["scaled_bones_h"] = server.scene.add_line_segments(
+                    "/scaled/bones",
+                    np.stack([sk[0, bp[:, 0]], sk[0, bp[:, 1]]], axis=1)
+                    .astype(np.float32),
+                    colors=(220, 30, 60), line_width=2.0)
+            toe = seg.get("scaled_toe")
+            if toe is not None and np.isfinite(toe[0]).all():
+                cur["scaled_toe_h"] = server.scene.add_point_cloud(
+                    "/scaled/toe", toe[0].astype(np.float32),
+                    colors=(245, 150, 20), point_size=0.04, point_shape="circle")
+        kb = seg.get("kabsch_skel")
+        if kb is not None and seg.get("kabsch_names"):
+            cur["kabsch_bp"] = _bone_pairs(BONE_CONNECTIONS, seg["kabsch_names"])
+            cur["kabsch_joints_h"] = server.scene.add_point_cloud(
+                "/kabsch/joints", kb[0].astype(np.float32),
+                colors=(60, 120, 235), point_size=0.02, point_shape="circle")
+            if cur["kabsch_bp"] is not None:
+                bp = cur["kabsch_bp"]
+                cur["kabsch_bones_h"] = server.scene.add_line_segments(
+                    "/kabsch/bones",
+                    np.stack([kb[0, bp[:, 0]], kb[0, bp[:, 1]]], axis=1)
+                    .astype(np.float32),
+                    colors=(120, 120, 120), line_width=1.5)
         cur["idx"] = idx
         cur["seg"] = seg
         cur["n"] = seg["n"]
@@ -672,6 +750,35 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
             cur["cur_h"].points = seg["viz_pos"][fi:fi+1].astype(np.float32)
         if cur["traj_h"] is not None:
             cur["traj_h"].visible = g_show_traj.value
+        # scaled IK-input skeleton (red) + toe (orange)
+        if cur["scaled_joints_h"] is not None and seg.get("scaled_skel") is not None:
+            s = seg["scaled_skel"][fi].astype(np.float32)
+            show = g_show_scaled.value
+            cur["scaled_joints_h"].points = s if show else s[:0]
+            if cur["scaled_bones_h"] is not None and cur["scaled_bp"] is not None:
+                bp = cur["scaled_bp"]
+                if show:
+                    cur["scaled_bones_h"].points = np.stack(
+                        [s[bp[:, 0]], s[bp[:, 1]]], axis=1).astype(np.float32)
+                else:
+                    cur["scaled_bones_h"].points = np.zeros((0, 2, 3),
+                                                             dtype=np.float32)
+            if cur["scaled_toe_h"] is not None and seg.get("scaled_toe") is not None:
+                tv = seg["scaled_toe"][fi].astype(np.float32)
+                cur["scaled_toe_h"].points = tv if show else tv[:0]
+        # un-scaled Kabsch overlay (blue)
+        if cur["kabsch_joints_h"] is not None and seg.get("kabsch_skel") is not None:
+            k = seg["kabsch_skel"][fi].astype(np.float32)
+            show = g_show_kabsch.value
+            cur["kabsch_joints_h"].points = k if show else k[:0]
+            if cur["kabsch_bones_h"] is not None and cur["kabsch_bp"] is not None:
+                bp = cur["kabsch_bp"]
+                if show:
+                    cur["kabsch_bones_h"].points = np.stack(
+                        [k[bp[:, 0]], k[bp[:, 1]]], axis=1).astype(np.float32)
+                else:
+                    cur["kabsch_bones_h"].points = np.zeros((0, 2, 3),
+                                                             dtype=np.float32)
         g_frame.value = fi
 
     def request_clip(target):
@@ -691,14 +798,18 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
     g_fps = server.gui.add_slider("fps", 1, 120, 1, 30)
     g_show_traj = server.gui.add_checkbox("trajectory", True)
     g_show_g1 = server.gui.add_checkbox("show G1", True)
+    g_show_scaled = server.gui.add_checkbox("show scaled (IK input)", True)
+    g_show_kabsch = server.gui.add_checkbox("show Kabsch (un-scaled)", False)
     g_name = server.gui.add_text("clip", "")
     g_dur = server.gui.add_text("info", "")
     g_terrain = server.gui.add_text("terrain", "")
     server.gui.add_button("next (N)").on_click(lambda _: request_clip(cur["idx"] + 1))
     server.gui.add_button("prev (P)").on_click(lambda _: request_clip(cur["idx"] - 1))
     server.gui.add_markdown(
-        "**gold** = current pelvis &nbsp; | &nbsp; **blue line** = trajectory "
-        "&nbsp; | &nbsp; **blue mesh** = terrain &nbsp; | &nbsp; **grey** = ground")
+        "**red** = scaled human (IK input) &nbsp; | &nbsp; **orange** = scaled toe "
+        "&nbsp; | &nbsp; **blue** = un-scaled Kabsch &nbsp; | &nbsp; **gold** = "
+        "current pelvis &nbsp; | &nbsp; **cyan line** = trajectory &nbsp; | &nbsp; "
+        "**blue mesh** = terrain &nbsp; | &nbsp; **grey** = ground")
 
     g_clip.on_update(lambda _: request_clip(int(g_clip.value) - 1))
 
