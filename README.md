@@ -374,6 +374,10 @@ python DataLib/preprocess/seg_duration_dist.py --data-root data/MorphData_v1
 # Browse the cleaned segments in one MuJoCo G1 viewer (N = next trajectory).
 python DataLib/preprocess/browse_clean.py --cat traversal_mantle
 
+# Browse with terrain + ground (terrain mode; relaunches per clip).
+# stairs works with the shipped samples; traversal_* need MorphDataTerrain_v1.
+python DataLib/preprocess/browse_clean.py --cat stairs --terrain-dir data/sample/terrain
+
 # Rollback if needed:
 python DataLib/preprocess/rollback_clean.py --data-root data/MorphData_v1
 ```

@@ -103,8 +103,17 @@ Keys: `Space`=pause, `Left/Right`=step, `Backspace`=reset, **`N`=next
 trajectory**, **`P`=previous**, `T`=toggle trajectory overlay, `O`=toggle
 orientation arrows, `V`=toggle velocity arrows, `Esc`/`Q`=quit. The next
 segment is retargeted in a background thread while the current one plays, so
-jumping with `N` is usually instant. Terrain is off by default (the full
-terrain set is not vendored). Requires a display and the `mujoco`/`mink`/
+jumping with `N` is usually instant.
+
+A checkerboard **ground plane** is always shown. Add **terrain** with
+`--terrain-dir`: each clip's terrain (from its meta `terrain_ref`) is baked
+into the scene through the same transform pipeline as the motion. In terrain
+mode the viewer relaunches per clip so the terrain matches (the next clip is
+pre-retargeted in the background, so `N` is still fast). The full terrain set
+is not vendored — extract `MorphDataTerrain_v1.zip` into a folder and point
+`--terrain-dir` there. (`stairs` works with the shipped
+`data/sample/terrain/`; `traversal_*` need the full set; `ground` has no
+terrain and shows ground only.) Requires a display and the `mujoco`/`mink`/
 `scipy` runtime deps.
 
 ## Results on MorphData_v1 (v1)

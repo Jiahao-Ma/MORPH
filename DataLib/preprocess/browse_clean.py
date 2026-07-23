@@ -17,13 +17,16 @@ single passive MuJoCo viewer with keys to JUMP between trajectories:
 
 The next segment is retargeted in a background thread while the current one
 plays, so jumping with N is usually instant (the viewer keeps rendering while
-a not-yet-ready segment is being prepared). Terrain is not loaded by default
-(the full terrain set is not vendored); pass --terrain-dir to bake each
-segment's terrain into the scene (rebuilds the model on switch).
+a not-yet-ready segment is being prepared). A checkerboard GROUND plane is
+always shown. Pass --terrain-dir to also bake each clip's TERRAIN (from its
+meta `terrain_ref`) into the scene; in terrain mode the viewer relaunches per
+clip so the terrain matches the motion (the full terrain set is not vendored;
+extract MorphDataTerrain_v1.zip into a folder and point --terrain-dir there).
 
 Run from the Morph/ directory:
   python DataLib/preprocess/browse_clean.py --cat traversal_mantle
   python DataLib/preprocess/browse_clean.py --cat ground --limit 20
+  python DataLib/preprocess/browse_clean.py --cat stairs --terrain-dir data/sample/terrain
   python DataLib/preprocess/browse_clean.py --all --shuffle
 """
 import sys
@@ -59,10 +62,13 @@ CATEGORIES = list(CATEGORY_SCALE.keys())
 
 
 def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
-                     height_from_data=True):
+                     height_from_data=True, terrain_dir=None,
+                     terrain_ground_z0=0.0):
     """Run the S5 retarget flow (same as ue_world_skeleton_retarget.main s5)
-    and return the artifacts needed for visualization. No file export, no
-    terrain. Returns dict: qpos, fps, look_fwd_xy, des_vel, move_input."""
+    and return the artifacts needed for visualization. No file export.
+    If terrain_dir is given, also loads the segment's terrain (from its
+    meta `terrain_ref`) through the same transform pipeline. Returns dict:
+    qpos, fps, look_fwd_xy, des_vel, move_input, terrain."""
     jsonl = str(jsonl); meta = str(meta)
     bone_names, _ = rt.load_meta(meta)
     frames = rt.load_frames(jsonl)
@@ -158,8 +164,25 @@ def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
         fps = float(json.load(open(meta)).get("sample_rate_hz", 60.0))
     except Exception:
         pass
+
+    terrain = None
+    if terrain_dir:
+        ns = argparse.Namespace(terrain=None, terrain_dir=str(terrain_dir),
+                                meta=meta)
+        tpath = rt._resolve_terrain_path(ns)
+        if tpath:
+            try:
+                terrain = rt.load_terrain_world(
+                    tpath, R_global, t_global,
+                    ground_z0_cm=terrain_ground_z0,
+                    data_scale=data_scale)
+            except Exception as e:
+                print(f"  [terrain] FAILED ({type(e).__name__}: {e}); "
+                      f"visualizing without terrain.")
+                terrain = None
     return dict(qpos=qpos_arr, fps=fps, look_fwd_xy=look_fwd_xy,
-                des_vel=des_vel, move_input=move_input, g1_model=g1_model)
+                des_vel=des_vel, move_input=move_input, g1_model=g1_model,
+                terrain=terrain)
 
 
 def build_playlist(cats, data_root=DATA_ROOT, limit=None, shuffle=False, seed=0):
@@ -186,8 +209,10 @@ class Prefetcher:
     """Retarget segment indices in a single background thread. The main viewer
     thread never runs retarget concurrently, so GMR is single-threaded."""
 
-    def __init__(self, playlist):
+    def __init__(self, playlist, terrain_dir=None, terrain_ground_z0=0.0):
         self.playlist = playlist
+        self.terrain_dir = terrain_dir
+        self.terrain_ground_z0 = terrain_ground_z0
         self.cache = {}            # idx -> result dict | Exception
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -197,7 +222,9 @@ class Prefetcher:
 
     def _retarget(self, idx):
         it = self.playlist[idx]
-        return retarget_segment(it["jsonl"], it["meta"], it["scale"])
+        return retarget_segment(it["jsonl"], it["meta"], it["scale"],
+                                terrain_dir=self.terrain_dir,
+                                terrain_ground_z0=self.terrain_ground_z0)
 
     def _loop(self):
         while True:
@@ -237,14 +264,21 @@ class Prefetcher:
         return res
 
 
-def _build_g1_model():
+def build_model(terrain=None, xy_offset=None):
+    """Build the G1 MuJoCo model. A checkerboard ground plane is always
+    included; if `terrain` (verts, faces) is given it is baked in as a mesh,
+    shifted by xy_offset so it stays aligned with the recentered clip."""
     rt._ensure_gmr_on_path()
     from general_motion_retargeting.params import ROBOT_XML_DICT  # type: ignore
     g1_xml = pathlib.Path(str(ROBOT_XML_DICT["unitree_g1"]))
+    if xy_offset is None:
+        xy_offset = np.zeros(3)
+    terrain_asset, terrain_geom = rt._build_terrain_xml(terrain, xy_offset)
     wrapper = g1_xml.parent / "_browse_clean_wrapper.xml"
     wrapper.write_text(
         rt._WRAPPER_XML_TMPL.format(g1_xml_name=g1_xml.name,
-                                    terrain_asset="", terrain_geom=""),
+                                    terrain_asset=terrain_asset,
+                                    terrain_geom=terrain_geom),
         encoding="utf-8")
     import mujoco as mj  # type: ignore
     try:
@@ -253,139 +287,114 @@ def _build_g1_model():
         wrapper.unlink(missing_ok=True)
 
 
-def run_viewer(playlist, start=0, traj_window=100, marker_step=10):
+
+def run_viewer(playlist, start=0, traj_window=100, marker_step=10,
+               terrain_dir=None, terrain_ground_z0=0.0):
+    """Play the playlist in a MuJoCo G1 viewer with N/P to jump trajectories.
+
+    terrain_dir=None  -> one persistent viewer, ground plane only (instant N).
+    terrain_dir set   -> per-segment viewer with that clip's terrain baked in
+                         (the window relaunches on N/P so the terrain matches).
+    A checkerboard ground plane is always present."""
     import mujoco as mj  # type: ignore
     import mujoco.viewer  # type: ignore
 
-    model = _build_g1_model()
-    data = mj.MjData(model)
+    pf = Prefetcher(playlist, terrain_dir=terrain_dir,
+                    terrain_ground_z0=terrain_ground_z0)
 
-    pf = Prefetcher(playlist)
-    # Retarget the first segment (blocking) before opening the viewer.
-    print(f"\n[retarget #{start}] {playlist[start]['name']} "
-          f"({playlist[start]['cat']}) ...")
-    first = retarget_segment(playlist[start]["jsonl"], playlist[start]["meta"],
-                            playlist[start]["scale"])
-    with pf.lock:
-        pf.cache[start] = first
-        pf.cond.notify_all()
-    pf.request(start + 1)
-
-    state = {
-        "idx": start, "paused": True, "fi": 0, "step": 0,
-        "show_traj": True, "show_orient": True, "show_vel": False,
-        "pending": None,   # idx we are switching to once ready
-        "loading": False,
-    }
-
-    # Per-trajectory derived arrays (recomputed on switch).
-    seg = {"qpos": None, "fps": 60.0, "n": 0, "xy_offset": None,
-           "viz_pos": None, "rot": None, "pelvis_fwd": None,
-           "look": None, "des_vel": None, "move_input": None,
-           "have_look": False, "have_desvel": False, "have_moveinput": False}
-
-    def load_into_seg(res):
+    def make_seg(res):
         q = res["qpos"]
-        seg["qpos"] = q
-        seg["fps"] = res["fps"]
-        seg["n"] = q.shape[0]
-        seg["xy_offset"] = np.array([-q[0, 0], -q[0, 1], 0.0], dtype=np.float64)
-        seg["viz_pos"] = q[:, :3] + seg["xy_offset"]
+        xy = np.array([-q[0, 0], -q[0, 1], 0.0], dtype=np.float64)
         qw = q[:, 3:7]
         qxyzw = np.stack([qw[:, 1], qw[:, 2], qw[:, 3], qw[:, 0]], axis=1)
-        seg["rot"] = R.from_quat(qxyzw).as_matrix()
-        seg["pelvis_fwd"] = seg["rot"][:, :2, 0].astype(np.float32)
+        rot = R.from_quat(qxyzw).as_matrix()
+        n = q.shape[0]
         lk = res["look_fwd_xy"]
-        seg["have_look"] = lk is not None and lk.shape[0] >= seg["n"]
-        seg["look"] = lk if seg["have_look"] else None
+        have_look = lk is not None and lk.shape[0] >= n
         dv = res["des_vel"]
-        seg["have_desvel"] = dv is not None and dv.shape[0] >= seg["n"]
-        seg["des_vel"] = dv if seg["have_desvel"] else None
+        have_dv = dv is not None and dv.shape[0] >= n
         mi = res["move_input"]
-        seg["have_moveinput"] = mi is not None and mi.shape[0] >= seg["n"] and seg["have_look"]
-        seg["move_input"] = mi if seg["have_moveinput"] else None
-        state["fi"] = 0
+        have_mi = mi is not None and mi.shape[0] >= n and have_look
+        return dict(qpos=q, fps=res["fps"], n=n, xy_offset=xy,
+                    viz_pos=q[:, :3] + xy, rot=rot,
+                    pelvis_fwd=rot[:, :2, 0].astype(np.float32),
+                    look=lk if have_look else None,
+                    des_vel=dv if have_dv else None,
+                    move_input=mi if have_mi else None,
+                    have_look=have_look, have_desvel=have_dv,
+                    have_moveinput=have_mi, terrain=res.get("terrain"))
 
-    load_into_seg(first)
-
-    def switch_to(idx):
-        if idx < 0 or idx >= len(playlist):
-            print(f"  [boundary] already at {'start' if idx < 0 else 'end'} "
-                  f"of playlist (#{state['idx']+1}/{len(playlist)}).")
-            return False
-        if pf.has(idx):
-            try:
-                load_into_seg(pf.get(idx))
-                state["idx"] = idx
-                state["pending"] = None
-                state["loading"] = False
-                pf.request(idx + 1)
-                it = playlist[idx]
-                dur = seg["n"] / max(1.0, seg["fps"])
-                print(f"\n[#{idx+1}/{len(playlist)}] {it['name']} "
-                      f"({it['cat']})  n={seg['n']}  dur={dur:.1f}s  "
-                      f"fps={seg['fps']:.1f}")
-                return True
-            except Exception as e:
-                print(f"  [switch] failed #{idx}: {e}; skipping.")
-                state["pending"] = None
-                state["loading"] = False
-                return False
+    def render_frame(viewer, data, model, seg, state):
+        qpos = seg["qpos"][state["fi"]].copy()
+        qpos[:3] += seg["xy_offset"]
+        data.qpos[:] = qpos
+        mj.mj_forward(model, data)
+        fi = state["fi"]
+        if seg["have_desvel"]:
+            dv = seg["des_vel"][fi].astype(np.float64)
+            dvw = (seg["rot"][fi, :2, 0] * dv[0] + seg["rot"][fi, :2, 1] * dv[1])
         else:
-            pf.request(idx)
-            state["pending"] = idx
-            state["loading"] = True
-            if not state.get("_loading_announced"):
-                print(f"  [loading next trajectory #{idx+1} "
-                      f"{playlist[idx]['name']} ...]")
-                state["_loading_announced"] = True
-            return False
+            dvw = np.zeros(2)
+        if seg["have_moveinput"]:
+            mi = seg["move_input"][fi].astype(np.float64)
+            lf = seg["look"][fi].astype(np.float64)
+            lr = np.array([lf[1], -lf[0]])
+            miw = lf * mi[0] + lr * mi[1]
+        else:
+            miw = np.zeros(2)
+        scn = viewer.user_scn
+        scn.ngeom = 0
+        if state["show_traj"]:
+            rt._add_traj_overlay(viewer, fi, seg["viz_pos"], seg["rot"],
+                                 window=traj_window, marker_step=marker_step)
+        if state["show_orient"]:
+            rt._append_orientation_arrows(
+                scn, base_xy=seg["viz_pos"][fi, :2],
+                pelvis_dir_xy=seg["pelvis_fwd"][fi],
+                look_dir_xy=seg["look"][fi] if seg["have_look"] else None)
+            if state["show_vel"] and seg["have_desvel"]:
+                rt._append_desvel_arrow(scn, seg["viz_pos"][fi, :2], dvw)
+            if state["show_vel"] and seg["have_moveinput"]:
+                rt._append_moveinput_arrow(scn, seg["viz_pos"][fi, :2], miw)
+        viewer.sync()
 
-    def key_cb(k):
-        if k == 32:        # Space
-            state["paused"] = not state["paused"]
-        elif k == 262:     # Right
-            state["step"] = 1
-        elif k == 263:     # Left
-            state["step"] = -1
-        elif k == 259:     # Backspace
-            state["fi"] = 0
-        elif k == 78 or k == 110:   # N / n
-            switch_to(state["idx"] + 1)
-        elif k == 80 or k == 112:   # P / p
-            switch_to(state["idx"] - 1)
-        elif k == 84:      # T
-            state["show_traj"] = not state["show_traj"]
-        elif k == 79:      # O
-            state["show_orient"] = not state["show_orient"]
-        elif k == 86:      # V
-            state["show_vel"] = not state["show_vel"]
-        elif k in (256, 113):  # Esc / Q
-            state["quit"] = True
+    def make_key_cb(state, on_next, on_prev):
+        def cb(k):
+            if k == 32:            # Space
+                state["paused"] = not state["paused"]
+            elif k == 262:         # Right
+                state["step"] = 1
+            elif k == 263:         # Left
+                state["step"] = -1
+            elif k == 259:         # Backspace
+                state["fi"] = 0
+            elif k in (78, 110):   # N / n
+                on_next()
+            elif k in (80, 112):   # P / p
+                on_prev()
+            elif k == 84:          # T
+                state["show_traj"] = not state["show_traj"]
+            elif k == 79:          # O
+                state["show_orient"] = not state["show_orient"]
+            elif k == 86:          # V
+                state["show_vel"] = not state["show_vel"]
+            elif k in (256, 113):  # Esc / Q
+                state["quit"] = True
+        return cb
 
-    viewer = mujoco.viewer.launch_passive(
-        model=model, data=data, show_left_ui=False, show_right_ui=False,
-        key_callback=key_cb)
-    viewer.cam.lookat = np.array([0.0, 0.0, 0.85])
-    viewer.cam.distance = 3.5
-    viewer.cam.elevation = -15
-    viewer.cam.azimuth = 180
+    def announce(idx, seg):
+        it = playlist[idx]
+        if seg.get("terrain") is not None:
+            terr = "  +terrain"
+        elif terrain_dir:
+            terr = "  (no terrain found -> ground only)"
+        else:
+            terr = ""
+        print(f"\n[#{idx+1}/{len(playlist)}] {it['name']} ({it['cat']})  "
+              f"n={seg['n']}  dur={seg['n']/seg['fps']:.1f}s  "
+              f"fps={seg['fps']:.1f}{terr}")
 
-    it = playlist[start]
-    print(f"\n[#{start+1}/{len(playlist)}] {it['name']} ({it['cat']})  "
-          f"n={seg['n']}  dur={seg['n']/seg['fps']:.1f}s")
-    print("  Controls: Space=pause  Left/Right=step  Backspace=reset  "
-          "N=next  P=prev  T=traj  O=orient  V=vel  Esc=quit")
-    print("  Started PAUSED. Press Space to play, N to jump to the next clip.")
-
-    last_t = time.time()
-    while viewer.is_running() and not state.get("quit"):
-        # Resolve a pending switch when the target is ready.
-        if state["pending"] is not None:
-            if pf.has(state["pending"]):
-                switch_to(state["pending"])
-            # else keep rendering current while loading
-
+    def step_logic(state, seg, last_t):
         if state["step"] != 0:
             state["fi"] = (state["fi"] + state["step"]) % seg["n"]
             state["step"] = 0
@@ -399,48 +408,146 @@ def run_viewer(playlist, start=0, traj_window=100, marker_step=10):
                 wait = min(dt - (now - last_t), 0.001)
                 if wait > 0:
                     time.sleep(wait)
+                return last_t, False
+        return last_t, True
+
+    CTRL = ("  Controls: Space=pause  Left/Right=step  Backspace=reset  "
+            "N=next  P=prev  T=traj  O=orient  V=vel  Esc=quit")
+
+    # ── Mode A: persistent single viewer (ground plane only) ──
+    if terrain_dir is None:
+        model = build_model(None)
+        data = mj.MjData(model)
+        print(f"\n[retarget #{start}] {playlist[start]['name']} ...")
+        first = retarget_segment(playlist[start]["jsonl"], playlist[start]["meta"],
+                                 playlist[start]["scale"])
+        with pf.lock:
+            pf.cache[start] = first
+            pf.cond.notify_all()
+        pf.request(start + 1)
+        cur = {"seg": make_seg(first)}
+        state = {"idx": start, "paused": True, "fi": 0, "step": 0,
+                 "show_traj": True, "show_orient": True, "show_vel": False,
+                 "pending": None, "quit": False}
+
+        def switch_to(idx):
+            if idx < 0 or idx >= len(playlist):
+                print(f"  [boundary] {'start' if idx < 0 else 'end'} of playlist.")
+                return
+            if pf.has(idx):
+                try:
+                    cur["seg"] = make_seg(pf.get(idx))
+                    state["idx"] = idx
+                    state["pending"] = None
+                    pf.request(idx + 1)
+                    announce(idx, cur["seg"])
+                except Exception as e:
+                    print(f"  [switch] failed #{idx}: {e}; skipping.")
+                    state["pending"] = None
+            else:
+                pf.request(idx)
+                state["pending"] = idx
+                if not state.get("_la"):
+                    print(f"  [loading next trajectory #{idx+1} "
+                          f"{playlist[idx]['name']} ...]")
+                    state["_la"] = True
+
+        key_cb = make_key_cb(state,
+                             lambda: switch_to(state["idx"] + 1),
+                             lambda: switch_to(state["idx"] - 1))
+        viewer = mujoco.viewer.launch_passive(
+            model=model, data=data, show_left_ui=False, show_right_ui=False,
+            key_callback=key_cb)
+        viewer.cam.lookat = np.array([0.0, 0.0, 0.85])
+        viewer.cam.distance = 3.5
+        viewer.cam.elevation = -15
+        viewer.cam.azimuth = 180
+        announce(start, cur["seg"])
+        print(CTRL)
+        print("  Started PAUSED. Press Space to play, N to jump to the next clip.")
+        last_t = time.time()
+        while viewer.is_running() and not state["quit"]:
+            if state["pending"] is not None and pf.has(state["pending"]):
+                switch_to(state["pending"])
+            last_t, proceed = step_logic(state, cur["seg"], last_t)
+            if not proceed:
                 continue
+            render_frame(viewer, data, model, cur["seg"], state)
+            if state["paused"] and state["step"] == 0 and state["pending"] is None:
+                time.sleep(0.01)
+        viewer.close()
+        return
 
-        qpos = seg["qpos"][state["fi"]].copy()
-        qpos[:3] += seg["xy_offset"]
-        data.qpos[:] = qpos
-        mj.mj_forward(model, data)
+    # ── Mode B: per-segment viewer with terrain baked in ──
+    print(f"\n[retarget #{start}] {playlist[start]['name']} ...")
+    first = retarget_segment(playlist[start]["jsonl"], playlist[start]["meta"],
+                             playlist[start]["scale"], terrain_dir=terrain_dir,
+                             terrain_ground_z0=terrain_ground_z0)
+    with pf.lock:
+        pf.cache[start] = first
+        pf.cond.notify_all()
+    pf.request(start + 1)
+    idx = start
+    while 0 <= idx < len(playlist):
+        seg = make_seg(pf.get(idx))
+        model = build_model(seg.get("terrain"), seg["xy_offset"])
+        data = mj.MjData(model)
+        state = {"idx": idx, "paused": True, "fi": 0, "step": 0,
+                 "show_traj": True, "show_orient": True, "show_vel": False,
+                 "advance": None, "quit": False, "_la": False}
+        start_idx = idx
 
-        fi = state["fi"]
-        if seg["have_desvel"]:
-            dv = seg["des_vel"][fi].astype(np.float64)
-            dv_world_xy = (seg["rot"][fi, :2, 0] * dv[0]
-                           + seg["rot"][fi, :2, 1] * dv[1])
-        else:
-            dv_world_xy = np.zeros(2)
-        if seg["have_moveinput"]:
-            mi = seg["move_input"][fi].astype(np.float64)
-            lf = seg["look"][fi].astype(np.float64)
-            lr = np.array([lf[1], -lf[0]])
-            mi_world_xy = lf * mi[0] + lr * mi[1]
-        else:
-            mi_world_xy = np.zeros(2)
+        def request_advance(target):
+            if target < 0 or target >= len(playlist):
+                print(f"  [boundary] {'start' if target < 0 else 'end'} of playlist.")
+                return
+            state["advance"] = target
 
-        scn = viewer.user_scn
-        scn.ngeom = 0
-        if state["show_traj"]:
-            rt._add_traj_overlay(viewer, fi, seg["viz_pos"], seg["rot"],
-                                 window=traj_window, marker_step=marker_step)
-        if state["show_orient"]:
-            rt._append_orientation_arrows(
-                scn, base_xy=seg["viz_pos"][fi, :2],
-                pelvis_dir_xy=seg["pelvis_fwd"][fi],
-                look_dir_xy=seg["look"][fi] if seg["have_look"] else None)
-            if state["show_vel"] and seg["have_desvel"]:
-                rt._append_desvel_arrow(scn, seg["viz_pos"][fi, :2], dv_world_xy)
-            if state["show_vel"] and seg["have_moveinput"]:
-                rt._append_moveinput_arrow(scn, seg["viz_pos"][fi, :2], mi_world_xy)
-        viewer.sync()
-
-        if state["paused"] and state["step"] == 0 and state["pending"] is None:
-            time.sleep(0.01)
-
-    viewer.close()
+        key_cb = make_key_cb(state,
+                             lambda: request_advance(state["idx"] + 1),
+                             lambda: request_advance(state["idx"] - 1))
+        viewer = mujoco.viewer.launch_passive(
+            model=model, data=data, show_left_ui=False, show_right_ui=False,
+            key_callback=key_cb)
+        viewer.cam.lookat = np.array([0.0, 0.0, 0.85])
+        viewer.cam.distance = 3.5
+        viewer.cam.elevation = -15
+        viewer.cam.azimuth = 180
+        announce(idx, seg)
+        print(CTRL)
+        print("  Terrain mode: N/P relaunch the window with the next clip's "
+              "terrain. Started PAUSED.")
+        last_t = time.time()
+        advanced = False
+        while viewer.is_running() and not state["quit"]:
+            if state["advance"] is not None:
+                target = state["advance"]
+                if pf.has(target):
+                    idx = target
+                    state["advance"] = None
+                    viewer.close()
+                    advanced = True
+                    break
+                else:
+                    pf.request(target)
+                    if not state["_la"]:
+                        print(f"  [loading next trajectory #{target+1} "
+                              f"{playlist[target]['name']} ...]")
+                        state["_la"] = True
+            last_t, proceed = step_logic(state, seg, last_t)
+            if not proceed:
+                continue
+            render_frame(viewer, data, model, seg, state)
+            if state["paused"] and state["step"] == 0 and state["advance"] is None:
+                time.sleep(0.01)
+        if not advanced:
+            # window closed manually or quit key
+            try:
+                viewer.close()
+            except Exception:
+                pass
+            return
+        # else loop relaunches for the new idx
 
 
 def main():
@@ -462,6 +569,15 @@ def main():
     ap.add_argument("--traj-window", type=int, default=100,
                     help="trajectory overlay window (frames). <=0 = full clip")
     ap.add_argument("--marker-step", type=int, default=10)
+    ap.add_argument("--terrain-dir", default=None,
+                    help="Directory holding terrain_<hash>.json files. When set, "
+                         "each clip's terrain (from its meta `terrain_ref`) is "
+                         "baked into the scene and the viewer relaunches per "
+                         "clip so the terrain matches. Without it, only the "
+                         "ground plane is shown in one persistent viewer.")
+    ap.add_argument("--terrain-ground-z0", type=float, default=0.0,
+                    help="UE ground height (cm) used as the terrain z0 "
+                         "reference (subtracted from UE Z). Default 0.")
     args = ap.parse_args()
 
     cats = CATEGORIES if args.all else [args.cat]
@@ -471,8 +587,15 @@ def main():
         print(f"No segments found under {args.data_root} for {cats}.")
         sys.exit(1)
     print(f"[playlist] {len(playlist)} segments across {cats}")
+    if args.terrain_dir:
+        print(f"[terrain] dir={args.terrain_dir}  "
+              f"(per-clip viewer with terrain + ground)")
+    else:
+        print("[terrain] off (ground plane only). Pass --terrain-dir to add terrain.")
     run_viewer(playlist, start=min(args.start, len(playlist) - 1),
-               traj_window=args.traj_window, marker_step=args.marker_step)
+               traj_window=args.traj_window, marker_step=args.marker_step,
+               terrain_dir=args.terrain_dir,
+               terrain_ground_z0=args.terrain_ground_z0)
 
 
 if __name__ == "__main__":
