@@ -66,6 +66,38 @@ CATEGORY_SCALE = {
 }
 CATEGORIES = list(CATEGORY_SCALE.keys())
 
+# When terrain is shown, keep only the faces inside the trajectory XY bbox +
+# this margin (m), so far-away terrain instances the clip never reaches are
+# hidden. Set by --terrain-margin. (visualize.py shows the whole terrain file;
+# browse_clean crops to the clip's path for a less cluttered view.)
+TERRAIN_MARGIN = 3.0
+
+
+def _crop_terrain(terrain, xy_pts, margin):
+    """Keep only terrain faces whose centroid XY is inside the trajectory XY
+    bbox + margin. Returns reindexed (verts, faces), or the original when
+    nothing/very little survives (fallback so we never show an empty scene)."""
+    if terrain is None:
+        return None
+    verts = np.asarray(terrain[0], dtype=np.float64)
+    faces = np.asarray(terrain[1], dtype=np.int64)
+    if xy_pts is None or len(xy_pts) == 0 or faces.shape[0] == 0:
+        return (verts, faces)
+    xmin = float(xy_pts[:, 0].min()) - margin
+    xmax = float(xy_pts[:, 0].max()) + margin
+    ymin = float(xy_pts[:, 1].min()) - margin
+    ymax = float(xy_pts[:, 1].max()) + margin
+    fc = verts[faces].mean(axis=1)            # (F, 3) face centroids
+    keep = ((fc[:, 0] >= xmin) & (fc[:, 0] <= xmax) &
+            (fc[:, 1] >= ymin) & (fc[:, 1] <= ymax))
+    if keep.sum() == 0:
+        return (verts, faces)                 # fallback: nothing survives -> show all
+    faces = faces[keep]
+    used = np.unique(faces.reshape(-1))
+    remap = -np.ones(len(verts), dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return (verts[used], remap[faces])
+
 
 def retarget_segment(jsonl, meta, data_scale, smooth_win=9, per_foot=True,
                      height_from_data=True, terrain_dir=None,
@@ -336,7 +368,9 @@ def make_seg(res):
                 des_vel=dv if have_dv else None,
                 move_input=mi if have_mi else None,
                 have_look=have_look, have_desvel=have_dv,
-                have_moveinput=have_mi, terrain=res.get("terrain"),
+                have_moveinput=have_mi,
+                terrain=_crop_terrain(res.get("terrain"),
+                                      q[:, :2], TERRAIN_MARGIN),
                 scaled_skel=_rc(res.get("scaled_skel")),
                 scaled_names=res.get("scaled_names"),
                 scaled_toe=_rc(res.get("scaled_toe")),
@@ -632,6 +666,8 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
     cur = {"idx": start, "seg": None, "n": 0, "g1_handles": [], "g1_model": None,
            "g1_data": None, "terrain_h": None, "traj_h": None, "cur_h": None,
            "pending": None,
+           "clip_target": None,        # (idx, timestamp) debounced slider request
+           "loading": False,           # suppress clip-slider on_update during programmatic set
            "scaled_joints_h": None, "scaled_bones_h": None, "scaled_toe_h": None,
            "scaled_bp": None,
            "kabsch_joints_h": None, "kabsch_bones_h": None, "kabsch_bp": None}
@@ -721,7 +757,10 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
         cur["n"] = seg["n"]
         g_frame.value_max = max(0, seg["n"] - 1)
         g_frame.value = 0
+        cur["loading"] = True        # suppress on_update while we move the slider
         g_clip.value = idx + 1
+        cur["loading"] = False
+        cur["clip_target"] = None
         g_name.value = playlist[idx]["name"]
         g_dur.value = f"{seg['n']/seg['fps']:.1f}s  ({playlist[idx]['cat']})"
         if seg.get("terrain") is not None:
@@ -803,26 +842,46 @@ def run_viser_viewer(playlist, start=0, traj_window=100, marker_step=10,
     g_name = server.gui.add_text("clip", "")
     g_dur = server.gui.add_text("info", "")
     g_terrain = server.gui.add_text("terrain", "")
-    server.gui.add_button("next (N)").on_click(lambda _: request_clip(cur["idx"] + 1))
-    server.gui.add_button("prev (P)").on_click(lambda _: request_clip(cur["idx"] - 1))
+    # Keyboard shortcuts via the command palette (viser commands accept hotkeys).
+    server.gui.add_command("next clip", hotkey="n").on_trigger(
+        lambda _: request_clip(cur["idx"] + 1))
+    server.gui.add_command("prev clip", hotkey="p").on_trigger(
+        lambda _: request_clip(cur["idx"] - 1))
+    server.gui.add_button("next").on_click(lambda _: request_clip(cur["idx"] + 1))
+    server.gui.add_button("prev").on_click(lambda _: request_clip(cur["idx"] - 1))
     server.gui.add_markdown(
         "**red** = scaled human (IK input) &nbsp; | &nbsp; **orange** = scaled toe "
         "&nbsp; | &nbsp; **blue** = un-scaled Kabsch &nbsp; | &nbsp; **gold** = "
         "current pelvis &nbsp; | &nbsp; **cyan line** = trajectory &nbsp; | &nbsp; "
         "**blue mesh** = terrain &nbsp; | &nbsp; **grey** = ground")
 
-    g_clip.on_update(lambda _: request_clip(int(g_clip.value) - 1))
+    # The clip slider is debounced: dragging fires on_update for every
+    # intermediate value, so we only request the clip after the slider has been
+    # quiet for a beat (otherwise cached intermediate clips yank the slider back
+    # mid-drag). Programmatic sets from load_segment are suppressed via `loading`.
+    def _on_clip_slider(_):
+        if cur["loading"]:
+            return
+        cur["clip_target"] = (int(g_clip.value) - 1, time.time())
+
+    g_clip.on_update(_on_clip_slider)
 
     load_segment(start)
     render(0)
 
     _vp = getattr(server, "port", port)
     print(f"\n[viser] http://localhost:{_vp}  — {len(playlist)} clips")
-    print("  Use the clip slider or next/prev buttons to jump trajectories. "
-          "Close with Ctrl-C.")
+    print("  Drag the clip slider, click next/prev, or press N/P (command palette) "
+          "to jump trajectories. Close with Ctrl-C.")
 
     try:
         while True:
+            # Resolve a debounced clip-slider request once it has been quiet.
+            if cur["clip_target"] is not None:
+                tgt, ts = cur["clip_target"]
+                if time.time() - ts >= 0.15:
+                    cur["clip_target"] = None
+                    request_clip(tgt)
             if cur["pending"] is not None and pf.has(cur["pending"]):
                 t = cur["pending"]
                 cur["pending"] = None
@@ -866,6 +925,11 @@ def main():
     ap.add_argument("--terrain-ground-z0", type=float, default=0.0,
                     help="UE ground height (cm) used as the terrain z0 "
                          "reference (subtracted from UE Z). Default 0.")
+    ap.add_argument("--terrain-margin", type=float, default=3.0,
+                    help="When terrain is shown, keep only terrain faces inside "
+                         "the trajectory XY bbox + this margin (m), so far-away "
+                         "terrain the clip never reaches is hidden. 0 = show all. "
+                         "Default 3.0.")
     ap.add_argument("--viewer", choices=["mujoco", "viser"], default="mujoco",
                     help="Viewer backend. 'mujoco' = native MuJoCo window "
                          "(default). 'viser' = web 3D viewer (needs `pip install "
@@ -874,6 +938,9 @@ def main():
     ap.add_argument("--port", type=int, default=8080,
                     help="viser server port (default 8080).")
     args = ap.parse_args()
+
+    global TERRAIN_MARGIN
+    TERRAIN_MARGIN = args.terrain_margin
 
     cats = CATEGORIES if args.all else [args.cat]
     playlist = build_playlist(cats, data_root=pathlib.Path(args.data_root),
