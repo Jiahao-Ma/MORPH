@@ -41,6 +41,15 @@ extract them to).
 This repo ships trimmed samples under `data/sample/` only; the full v1 set is
 not vendored here.
 
+> ⚠ **Clean the raw captures before use.** The v1 recordings contain two
+> pervasive logging/capture artifacts — ~47% of all frames are stuck
+> duplicate frames, and the rest is fragmented by 200k+ big capture gaps —
+> which produce phantom velocities, 0.1 s+ holes, and 70+ m/s teleport spikes.
+> **Always run the preprocessing pipeline in [`DataLib/preprocess/`](DataLib/preprocess)
+> first** (see [§9. Preprocess / clean the raw captures](#9-preprocess--clean-the-raw-captures-important));
+> it is non-destructive and reversible. The before/after tables there show
+> why this step matters.
+
 ---
 
 ## 1. Repository layout
@@ -60,6 +69,13 @@ Morph/
 │   │   └── joint_mapping.json              # robot↔human joint pairing for errors
 │   ├── terrain/
 │   │   └── convert_terrain.py             # UE terrain JSON -> MuJoCo / IsaacLab
+│   ├── preprocess/                      # OFFLINE cleaning of raw MorphData_v1 (run before retarget)
+│   │   ├── clean_morph.py                # dt-gap + disp/dt-speed cleaner (stages segments)
+│   │   ├── apply_clean.py                # swap staged segments into the dataset (backup + rollback)
+│   │   ├── rollback_clean.py             # undo an apply_clean.py swap
+│   │   ├── eval_clean.py                 # eval disp/dt speed / dt dist / duration (before & after)
+│   │   ├── seg_duration_dist.py          # duration distribution of cleaned segments
+│   │   └── README.md                     # rules, usage, before/after tables
 │   └── gmr/                              # vendored trimmed GMR (no torch/etc.)
 │       └── general_motion_retargeting/   # params, motion_retarget, neck_retarget, data_loader
 │           ├── ik_configs/               # bvh_ue5_native_to_g1.json, bvh_ue5_g1scale_to_g1.json
@@ -293,3 +309,158 @@ Terrain (per `--name`):
   unique terrain hash) rather than duplicated inside each category folder.
   Every terrain-consuming script takes a `--terrain-dir` pointing there;
   recordings resolve theirs from `meta.json`'s `terrain_ref`.
+
+---
+
+## 9. Preprocess / clean the raw captures (important)
+
+> **This step is mandatory before retargeting or training on the full v1
+> set.** The raw `MorphData_v1` captures are not directly usable: ~47% of
+> all frames are stuck duplicate frames (a logging artifact of writing
+> multiple frames per engine tick, `dt≈1e-5` s with identical positions),
+> and the rest is fragmented by 213,627 capture gaps of `dt>0.1` s caused by
+> multi-threaded capture instability. Left untreated, these inflate
+> per-frame displacement to 70+ m/s teleport spikes and punch 0.1 s+ holes
+> through every clip — which then poison the retargeting IK and any model
+> trained on the data. The cleaner in [`DataLib/preprocess/`](DataLib/preprocess)
+> removes both classes of artifact and is **non-destructive and reversible**
+> (originals are backed up; a rollback manifest is written).
+
+### Cleaning rules (per frame `k`, with a predecessor)
+
+```
+dt < 0.005s            -> stuck frame: drop (dedup)
+dt > 0.1s              -> big gap: SPLIT point (keep k as new segment start)
+0.05 < dt <= 0.1s      -> small gap: keep k, interpolate missing frames
+0.005<dt<0.05 and disp/dt>10 m/s -> mutation:
+     return-speed |p[k+1]-p[k-1]|/(t[k+1]-t[k-1]) < 10 m/s -> glitch: drop k
+     else                                              -> teleport: SPLIT point
+else                   -> normal: keep
+Segment filter: keep if n_frames >= 60 AND sum(dt) >= 1.0s
+```
+
+* `dt` is the **real** `t[k]-t[k-1]` (never the assumed 1/60), so stuck frames
+  are caught instead of inflating speed.
+* `disp/dt = |root.p[k]-root.p[k-1]| / dt / 100` (m/s; `root.p` is UE cm)
+  measures **actual root displacement** — robust to the engine's phantom
+  `phy.v` spikes and also catches kinematic position corrections `phy.v`
+  does not reflect. 10 m/s is the natural gap between real motion
+  (envelope ≤ ~7.5 m/s) and noise spikes (≥ 10 m/s, always 1–3 frame needles).
+
+### Usage (from the `Morph/` directory)
+
+```bash
+# 1. Stage cleaned segments (originals untouched). Writes a manifest + stats.
+python DataLib/preprocess/clean_morph.py \
+    --data-root data/MorphData_v1 \
+    --out-root  data/MorphData_v1_cleaned_staging
+
+# 2. (optional) Evaluate the raw dataset first as a baseline.
+python DataLib/preprocess/eval_clean.py --data-root data/MorphData_v1
+
+# 3. Swap staged segments into the dataset (originals backed up).
+python DataLib/preprocess/apply_clean.py \
+    --data-root data/MorphData_v1 \
+    --stage-root data/MorphData_v1_cleaned_staging \
+    --backup-dir data/MorphData_v1_originals_backup
+
+# 4. Evaluate the cleaned dataset in place.
+python DataLib/preprocess/eval_clean.py --data-root data/MorphData_v1
+
+# 5. Duration distribution of the cleaned segments.
+python DataLib/preprocess/seg_duration_dist.py --data-root data/MorphData_v1
+
+# Rollback if needed:
+python DataLib/preprocess/rollback_clean.py --data-root data/MorphData_v1
+```
+
+All paths and rule thresholds are CLI-configurable; see
+[`DataLib/preprocess/README.md`](DataLib/preprocess/README.md) for the full
+reference and tuning guide.
+
+### Before vs after on MorphData_v1 (v1)
+
+Cleaning stats:
+
+| metric | value |
+|---|---:|
+| input files (segments) | 1,858 |
+| input frames | 8,546,577 |
+| **output segments** | **4,746** |
+| **output frames** | **4,257,710** (49.8% retained) |
+| dropped stuck frames (dt<0.005) | 4,058,815 |
+| deleted glitch frames | 9,007 |
+| big-gap split points (dt>0.1) | 213,627 |
+| small-gap interpolated (0.05<dt<=0.1) | 2,361 |
+| dropped segments (<60 frames or <1s) | 210,739 |
+| unchanged files | 15 |
+
+Before vs after (disp/dt real displacement speed):
+
+| metric | before | after | change |
+|---|---:|---:|---|
+| segments | 1,858 | **4,746** | +2,888 (split) |
+| total frames | 8,546,577 | **4,257,710** | −4,288,867 (−50%, mostly stuck dupes) |
+| total duration | 40.68 h | **19.86 h** | −20.82 h (−51%, mostly <1s shards dropped) |
+| stuck frames (dt<0.005) | many | **0** | eliminated ✓ |
+| big gaps (dt>0.1) | 213,627 | **0** | eliminated ✓ |
+| global max dt | 5.67 s | **0.066 s** | no big gaps ✓ |
+| per-segment median dt | ~0.013–0.017 | **0.015 s** | back to ~1/60 ✓ |
+| disp/dt speed peak | 74.3 m/s | **13.4 m/s** | large drop ✓ |
+| >10 m/s frames | — | **3** | only small-gap boundary frames (kept by rule) |
+| >15 m/s frames | many | **0** | ✓ |
+
+Threshold hits after cleaning (disp/dt real speed):
+
+| speed threshold | frames hit |
+|---|---:|
+| > 6 m/s | 39,560 |
+| > 8 m/s | 5,633 |
+| > 10 m/s | 3 |
+| > 15 m/s | 0 |
+| > 20 m/s | 0 |
+| > 30 m/s | 0 |
+
+Per-category distribution after cleaning:
+
+| category | segments | frames | hours | disp/dt peak (m/s) |
+|---|---:|---:|---:|---:|
+| ground | 21 | 840,406 | 3.90 | 8.2 |
+| stairs | 230 | 380,699 | 1.79 | 10.0 |
+| traversal_mantle | 1,588 | 1,104,080 | 5.13 | 10.0 |
+| traversal_mantle_vault | 1,950 | 1,310,826 | 6.14 | 10.0 |
+| traversal_vault | 957 | 621,699 | 2.91 | 13.4 |
+| **total** | **4,746** | **4,257,710** | **19.86** | — |
+
+Duration distribution of the cleaned segments (n=4,746, 19.86 h):
+
+| bin (s) | segments | % |
+|---|---:|---:|
+| <1 | 1 | 0.0% |
+| 1–2 | 733 | 15.4% |
+| 2–3 | 459 | 9.7% |
+| 3–5 | 712 | 15.0% |
+| **5–10** | **996** | **21.0%** |
+| 10–20 | 962 | 20.3% |
+| 20–30 | 439 | 9.2% |
+| 30–60 | 351 | 7.4% |
+| 60–120 | 77 | 1.6% |
+| 120–300 | 7 | 0.1% |
+| 300–600 | 1 | 0.0% |
+| 600–1800 | 8 | 0.2% |
+
+Percentiles: p1=1.11s, p5=1.36s, p10=1.51s, p25=2.97s, **p50=7.29s**,
+p75=15.96s, p90=28.95s, p95=41.15s, p99=67.43s; min=1.00s, max=1750.15s,
+mean=15.07s. Bimodal + long-tailed: primary peak 5–20 s (41%), secondary peak
+1–3 s (25%), long tail to ~29 min (all from `ground`).
+
+![segment duration distribution](DataLib/preprocess/assets/seg_duration_dist.png)
+
+> **Note on the 51% duration loss.** It is dominated by sub-second shards
+> being dropped (210,739 segments), not by valid motion being deleted — the
+> big gaps already shredded the raw data into sub-second pieces. To keep more
+> short actions, lower `--min-frames` (e.g. 30) or `--min-dur` (e.g. 0.5), or
+> interpolate 0.1–0.5 s gaps instead of splitting them. The 3 residual >10 m/s
+> frames are small-gap (0.05–0.1 s) boundary frames, which the rule
+> interpolates rather than splits (3/4.26M ≈ 0.00007%).
+
