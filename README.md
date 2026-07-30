@@ -279,7 +279,93 @@ python tests/visualize.py --cat traversal --mode verify --viewer viser
 
 ---
 
-## 7. Output format reference
+## 7. Recorded data format (capture input)
+
+Each recording is a trajectory written by the in-engine `UMotionCaptureComponent`
+as two files: `<Task>_<ActorID>_<GUID>_meta.json` + `<Task>_<ActorID>_<GUID>_frames.jsonl`.
+Terrain geometry is **not** in the recording — it lives in a shared
+`terrain_<hash>.json` referenced by `meta.terrain_ref` (see §1 layout).
+
+### 7.1 File-level (`*_meta.json`, written once per trajectory)
+
+| field | meaning |
+|-------|---------|
+| `schema_version` | `2.4` |
+| `project_name` / `task_name` / `character_name` | recording identity |
+| `skeleton_asset_path` | source skeletal mesh asset |
+| `sample_rate_hz` | capture rate (60) |
+| `num_joints` | bone count (88) |
+| `unit_system` | `UE_cm_deg` |
+| `start_time` | ISO-8601 capture start |
+| `bone_names[88]` + `parent_indices[88]` | skeleton hierarchy (each frame's `joints[].pi` indexes into this) |
+| `terrain_ref` / `terrain_hash` | shared terrain file this clip was recorded on |
+| `interacted_terrain_instance_ids[]` | terrain instances this trajectory's XY corridor actually touched |
+
+### 7.2 Frame-level (`*_frames.jsonl`, one line per frame @ 60 Hz)
+
+Top-level fields per frame:
+
+| field | meaning | source |
+|-------|---------|--------|
+| `t` | timestamp (s, since recording start, **sim time**) | `GetWorld()->GetTimeSeconds() - RecordingStartTime` |
+| `dt` | Δt to previous frame (s, sim time) | `Now - LastSampleTime` |
+| `f` | frame number (incrementing) | `CurrentFrameNumber++` |
+| `cmd` | command / observation (see §7.3) | `CaptureCommand` |
+| `root` | root (capsule + mesh ComponentToWorld) | `CaptureRoot` |
+| `phy` | physics state | `CapturePhysics` |
+| `foot` | foot contact | `CaptureFootContact` |
+| `joints[88]` | per-bone pose | `CaptureJoints` |
+
+**`root`** (UE world, cm / deg):
+* `p` / `q` — actor (capsule) world position / rotation (`GetActorLocation` / `GetActorQuat`)
+* `lv` / `av` — linear / angular velocity (`GetVelocity` / rotation-delta ÷ dt)
+* `mesh.p` / `mesh.q` / `mesh.s` — `SkeletalMeshComponent` ComponentToWorld (carries the
+  mesh→actor offset, Z = -capsule-half-height, Yaw = -90°, and scale). Stored because
+  `world_bone = mesh * bone_component_space`, so downstream never has to guess the offset.
+
+**`phy`**: `v` (CMC velocity), `gnd` (on-ground), `fall` (airborne), `crouch`, `mode` (`MovementMode`).
+
+**`foot`** (measured from the `ball_l`/`ball_r` toe bones, ray-cast down):
+* `lF` / `rF` — left / right foot in contact (sole-to-ground ≤ 2 cm)
+* `lP` / `rP` — left / right toe world positions
+* `lD` / `rD` — true sole-to-ground distance (cm)
+* `n` — ground normal
+
+**`joints[88]`** (per bone):
+* `n` bone name, `pi` parent index (into `meta.parent_indices`)
+* `lp` / `lq` — local (relative-to-parent) position / rotation
+* `cp` / `cq` — component-space position / rotation (`GetComponentSpaceTransforms`)
+* `wp` / `wq` — **world** position / rotation (ground truth, = `ComponentSpace * MeshToWorld`,
+  already includes the mesh offset + scale)
+
+### 7.3 `cmd` — what gets converted into the command block
+
+`cmd` is written by `CaptureCommand()` and grouped by robot-learning role:
+
+**Action (policy output targets)**
+* `move` `[x, y]` — WASD normalized input, x = right, y = forward. Source: a logical
+  `CommandSource` (e.g. `AutoLocomotionDriver`) if installed; else the `PlayerController`
+  physical keys; for AI with no source, the `AutoTraversalDriver`'s logical MoveInput.
+* `dLookY` / `dLookP` — per-frame camera Yaw / Pitch delta (deg, hardware-independent,
+  from consecutive control-rotation deltas).
+* `jump` — jump command (bool). During traversal it is driven by the
+  `AutoTraversalDriver`'s `bJumpCommand` pulse so mantle/vault attempts show up here.
+* `run` / `walk` / `sprint` / `crouch` — gait / posture **state** (persistent toggle state,
+  not instantaneous key-down). `run = !walk && !sprint`; walk ↔ sprint are mutually
+  exclusive; crouch is independent.
+
+**Observation (policy input context)**
+* `lookY` / `lookP` — current camera Yaw / Pitch (accumulated, `Ctrl->GetControlRotation`)
+* `desVB` `[x, y]` — body-frame desired velocity (x = forward, y = right). `move` rotated
+  by control yaw to world, then into the actor's body frame.
+* `desYR` — body-frame desired yaw rate (deg/s) = `dLookY / dt`.
+
+**Debug only (validation, never fed to the model)**
+* `mouseRaw` `[x, y]` — raw mouse delta (DPI-dependent; `PlayerController` only, zero for AI).
+
+---
+
+## 8. Output format reference
 
 Motion (per recording):
 
@@ -300,7 +386,7 @@ Terrain (per `--name`):
 
 ---
 
-## 8. Notes
+## 9. Notes
 
 * The vendored GMR under `DataLib/gmr/` is a **trimmed subset** of upstream
   GMR — only `params`, `motion_retarget`, `neck_retarget`, `data_loader`,
