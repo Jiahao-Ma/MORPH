@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# Local Codex/Cursor state and plans
+.codex/
+.cursor/
+
 # Generated exports (tests write here; do not commit)
 data/RetargetOutputs/
 
@@ -18,6 +22,12 @@ data/MorphData_v1_rollback_manifest.json
 data/MorphData_v1_eval.json
 data/MorphData_v1_seg_dur_dist.json
 data/MorphData_v1_seg_dur_dist.png
+
+# Immutable generated preprocessing stages and reports
+data/MorphData_v1_preprocessed/
+data/MorphData_v1_crouch_steering/
+data/MorphData_v1_g1/
+data/MorphData_v1_pipeline_report.md
 
 # Keep the trimmed sample recordings under data/sample/ tracked.
 !data/sample/

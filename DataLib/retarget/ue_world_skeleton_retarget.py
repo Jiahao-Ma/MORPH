@@ -1997,6 +1997,10 @@ def main():
     ap.add_argument("--no-output-cmd", action="store_true",
                     help="Do not save the per-frame command/root .npy. "
                          "Has no effect when --output-qpos is unset.")
+    ap.add_argument("--no-output-scaled", action="store_true",
+                    help="Do not save the auxiliary pre-IK scaled skeleton "
+                         "_scaled.npz. The scaled target is still computed "
+                         "internally because S5 pre-IK grounding needs it.")
     ap.add_argument("--no-orientation-arrows", action="store_true",
                     help="Hide the cyan (Actor) and magenta (Look) ground "
                          "arrows in the viewer. Toggle at runtime with the "
@@ -2302,37 +2306,40 @@ def main():
     #         WASD inputs, desired body-frame velocity, etc.). This is loaded
     #         independently from the motion array and never overwrites the
     #         motion .npy — see save_command_array.                                ──
-    print(f"\n[Command] Loading cmd fields from JSONL")
     cmd_arr = None
     look_fwd_xy = None
-    try:
-        # First pass: read look_yaw_deg for compute_look_fwd_xy (not in COMMAND_DTYPE).
-        look_yaw_raw: list[float] = []
-        with open(args.jsonl, "r") as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if not _line:
-                    continue
-                _row = json.loads(_line)
-                look_yaw_raw.append(float((_row.get("cmd") or {}).get("lookY", 0.0)))
-        # Second pass via load_gasp_command_data (all coord conversions applied).
-        cmd_arr_full = load_gasp_command_data(args.jsonl)
-        n_motion = qpos_arr.shape[0]
-        if cmd_arr_full.shape[0] != n_motion:
-            m = min(cmd_arr_full.shape[0], n_motion)
-            print(f"  [Command] aligning by truncation: jsonl={cmd_arr_full.shape[0]} "
-                  f"motion={n_motion} -> {m}")
-            cmd_arr = cmd_arr_full[:m].copy()
-            look_yaw_arr = np.asarray(look_yaw_raw[:m], dtype=np.float32)
-        else:
-            cmd_arr = cmd_arr_full.copy()
-            look_yaw_arr = np.asarray(look_yaw_raw, dtype=np.float32)
-        look_fwd_xy = compute_look_fwd_xy(look_yaw_arr, R_global)
-        print(f"  [Command] frames={cmd_arr.shape[0]}  "
-              f"look_fwd_xy mean|={float(np.linalg.norm(look_fwd_xy.mean(axis=0))):.3f}")
-    except Exception as e:
-        print(f"  [Command] FAILED ({type(e).__name__}: {e}); orientation arrows disabled.")
-        cmd_arr = None
+    if args.no_output_cmd and args.no_visualize:
+        print(f"\n[Command] SKIPPED (--no-output-cmd + --no-visualize).")
+    else:
+        print(f"\n[Command] Loading cmd fields from JSONL")
+        try:
+            # First pass: read look_yaw_deg for compute_look_fwd_xy (not in COMMAND_DTYPE).
+            look_yaw_raw: list[float] = []
+            with open(args.jsonl, "r") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    _row = json.loads(_line)
+                    look_yaw_raw.append(float((_row.get("cmd") or {}).get("lookY", 0.0)))
+            # Second pass via load_gasp_command_data (all coord conversions applied).
+            cmd_arr_full = load_gasp_command_data(args.jsonl)
+            n_motion = qpos_arr.shape[0]
+            if cmd_arr_full.shape[0] != n_motion:
+                m = min(cmd_arr_full.shape[0], n_motion)
+                print(f"  [Command] aligning by truncation: jsonl={cmd_arr_full.shape[0]} "
+                      f"motion={n_motion} -> {m}")
+                cmd_arr = cmd_arr_full[:m].copy()
+                look_yaw_arr = np.asarray(look_yaw_raw[:m], dtype=np.float32)
+            else:
+                cmd_arr = cmd_arr_full.copy()
+                look_yaw_arr = np.asarray(look_yaw_raw, dtype=np.float32)
+            look_fwd_xy = compute_look_fwd_xy(look_yaw_arr, R_global)
+            print(f"  [Command] frames={cmd_arr.shape[0]}  "
+                  f"look_fwd_xy mean|={float(np.linalg.norm(look_fwd_xy.mean(axis=0))):.3f}")
+        except Exception as e:
+            print(f"  [Command] FAILED ({type(e).__name__}: {e}); orientation arrows disabled.")
+            cmd_arr = None
 
     # ── Export ──────────────────────────────────────────────────────────────
     # Three sibling files, all named after the input JSONL stem so a clip's
@@ -2360,7 +2367,9 @@ def main():
         print(f"  Saved qpos → {out}  (shape: {qpos_arr.shape})")
 
         # part 1: scaled pre-IK skeleton
-        if scaled_skel_export is not None and scaled_names_export is not None:
+        if args.no_output_scaled:
+            print(f"  [Scaled-save] SKIPPED (--no-output-scaled).")
+        elif scaled_skel_export is not None and scaled_names_export is not None:
             scaled_out = out.with_name(out.stem + "_scaled.npz")
             try:
                 save_scaled_skeleton(scaled_out, scaled_skel_export,

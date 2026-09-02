@@ -10,7 +10,5 @@ numpy>=1.24
 scipy>=1.10
 rich>=13.0
 
-# Optional: web 3D viewer used by verify_pipeline*.py with `--viewer viser`.
-# Not required for export/batch/terrain, nor for `--viewer mujoco` (default).
-# Uncomment to enable:
-# viser>=0.2.0
+# Web 3D viewer used by verify_pipeline*.py and tests/visualize_by_terrain.py.
+viser>=1.0.30
